@@ -18,8 +18,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/client/metadata"
 	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/private/protocol/jsonrpc"
-	"github.com/aws/aws-sdk-go/private/signer/v4"
 )
 
 //The service client's operations are safe to be used concurrently.
@@ -69,13 +67,6 @@ func newClient(cfg aws.Config, handlers request.Handlers, endpoint, signingRegio
 			handlers,
 		),
 	}
-
-	// Handlers
-	svc.Handlers.Sign.PushBack(v4.Sign)
-	svc.Handlers.Build.PushBack(jsonrpc.Build)
-	svc.Handlers.Unmarshal.PushBack(jsonrpc.Unmarshal)
-	svc.Handlers.UnmarshalMeta.PushBack(jsonrpc.UnmarshalMeta)
-	svc.Handlers.UnmarshalError.PushBack(jsonrpc.UnmarshalError)
 
 	// Run custom client initialization if present
 	if initClient != nil {
