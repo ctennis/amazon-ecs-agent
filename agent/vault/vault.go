@@ -7,11 +7,15 @@ import (
 
 	"io/ioutil"
 	"os"
-
+    "regexp"
+    "strings"
+    
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/service/sts"
+	
+	//"github.com/cihub/seelog"
 
 	"github.com/hashicorp/vault/api"
 )
@@ -20,7 +24,7 @@ func apiClient(creds *credentials.Credentials) (*api.Client, error) {
     _, exists := os.LookupEnv("VAULT_ADDR")
 
     if(!exists) {
-        return nil, fmt.Errorf("VAULT_ADDR not set, cannot contact vault")
+        return nil, fmt.Errorf("VAULT_ADDR not set, cannot contact vault %#v", os.Environ())
     }
     
 	apiclient, err := api.NewClient(nil)
@@ -85,13 +89,39 @@ func auth(c *api.Client, creds *credentials.Credentials) (error) {
 
 
 func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials) (map[string]string, error) {
-    _, err := apiClient(creds)
+    c, err := apiClient(creds)
 
     if err != nil {
         return envVars, err
     }
 
-    return envVars, nil
+    //seelog.Errorf("TEST: IN SUBSITUTE SECRETS %v", envVars)
+
+	r, _ := regexp.Compile("^vault://(.+)")
+
+	for varName, varValue := range envVars {
+		if(r.MatchString(varValue)) {
+		
+			valStripped := strings.TrimLeft(varValue, "vault://")
+
+			result2 := strings.Split(valStripped, ":")
+			vaultLoc   := result2[0]
+			vaultField := result2[1]
+
+			sec, err := c.Logical().Read(vaultLoc)
+
+            if(err != nil) {
+                return nil, fmt.Errorf("Error %v looking up %v", err, vaultLoc)
+            }
+            
+            newVal := sec.Data[vaultField]
+
+            envVars[varName] = fmt.Sprintf("%v", newVal)
+
+		}
+	}
+
+	return envVars, nil
    
 }
 
