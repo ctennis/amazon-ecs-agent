@@ -6,7 +6,7 @@ node {
   def image_tag = "build-${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
 
   stage("Checkout") {
-    git url: "ssh://git@github.com/cloudbees/amazon-ecs-agent", branch: 'vault'
+    git url: "ssh://git@github.com/cloudbees/amazon-ecs-agent", branch: '${env.BRANCH_NAME}'
   }
 
   stage("Build") {
