@@ -147,6 +147,7 @@ func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials
 
 		if err != nil {
 			seelog.Errorf("Error reading %v from vault: %v", envVar.secret, err)
+			continue
 		}
 
 		newVal := sec.Data[envVar.field]
