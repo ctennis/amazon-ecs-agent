@@ -65,7 +65,7 @@ func apiClient() *api.Client {
 
 func auth(c *api.Client, creds *credentials.Credentials) error {
 	if c == nil {
-		return fmt.Errorf("api client is nil")
+		return fmt.Errorf("[vault] api client is nil")
 	}
 
 	stsSession := session.New(&aws.Config{Credentials: creds})
@@ -104,7 +104,7 @@ func auth(c *api.Client, creds *credentials.Credentials) error {
 	}
 
 	if secret == nil {
-		return fmt.Errorf("empty response from credential provider")
+		return fmt.Errorf("[vault] - empty response from credential provider")
 	}
 
 	c.SetToken(secret.Auth.ClientToken)
@@ -120,7 +120,7 @@ func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials
 	c := apiClient()
 
 	if c == nil {
-		return envVars, fmt.Errorf("Unable to get vault api client")
+		return envVars, fmt.Errorf("[vault] - Unable to get vault api client")
 	}
 
 	err := auth(c, creds)
@@ -139,19 +139,23 @@ func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials
 		var envVar, err = parseSecret(varValue)
 
 		if err != nil {
-			seelog.Errorf("Error parsing secret %v: %v", varValue, err)
+			seelog.Errorf("[vault] - error parsing secret %v: %v", varValue, err)
 			continue
 		}
 
 		sec, err := c.Logical().Read(envVar.secret)
 
 		if err != nil {
-			seelog.Errorf("Error reading %v from vault: %v", envVar.secret, err)
+			seelog.Errorf("[vault] - Error reading %v: %v", envVar.secret, err)
 			continue
 		}
 
-		newVal := sec.Data[envVar.field]
-		envVars[varName] = fmt.Sprintf("%v", newVal)
+		newVal, ok := sec.Data[envVar.field]
+		if(ok) {
+			envVars[varName] = fmt.Sprintf("%v", newVal)
+		} else {
+			seelog.Errorf("[vault] - field %v not found in secret %v", envVar.field, envVar.secret)
+		}
 
 	}
 
