@@ -63,7 +63,7 @@ func apiClient() *api.Client {
 	return client
 }
 
-func auth(c *api.Client, creds *credentials.Credentials) error {
+func auth(c *api.Client, creds *credentials.Credentials, vaultRole string) error {
 	if c == nil {
 		return fmt.Errorf("[vault] api client is nil")
 	}
@@ -97,6 +97,7 @@ func auth(c *api.Client, creds *credentials.Credentials) error {
 		"iam_request_url":         targetURL,
 		"iam_request_headers":     headers,
 		"iam_request_body":        body,
+                "role":                    vaultRole,
 	})
 
 	if err != nil {
@@ -123,7 +124,7 @@ func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials
 		return envVars, fmt.Errorf("[vault] - Unable to get vault api client")
 	}
 
-	err := auth(c, creds)
+	err := auth(c, creds, envVars["vault_role"])
 
 	if err != nil {
 		return envVars, err
