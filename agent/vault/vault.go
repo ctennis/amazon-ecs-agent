@@ -147,7 +147,12 @@ func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials
 		sec, err := c.Logical().Read(envVar.secret)
 
 		if err != nil {
-			seelog.Errorf("[vault] - Error reading %v: %v", envVar.secret, err)
+			seelog.Errorf("[vault] - rrror reading %v: %v", envVar.secret, err)
+			continue
+		}
+
+		if sec == nil {
+			seelog.Errorf("[vault] - secret not found: %v", envVar.secret)
 			continue
 		}
 
