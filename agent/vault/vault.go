@@ -117,7 +117,7 @@ func auth(c *api.Client, creds *credentials.Credentials, vaultRole string) error
 // connect to a vault server to replace that value with the actual secret
 //
 // Errors are attempted to be handled gracefully by just not substituting the value.
-func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials) (map[string]string, error) {
+func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials) (returnVars map[string]string, ferr error) {
 	c := apiClient()
 
 	if c == nil {
@@ -140,19 +140,22 @@ func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials
 		var envVar, err = parseSecret(varValue)
 
 		if err != nil {
-			seelog.Errorf("[vault] - error parsing secret %v: %v", varValue, err)
+			ferr = fmt.Errorf("[vault] - error parsing secret %v: %v", varValue, err)
+			seelog.Errorf("%v", ferr)
 			continue
 		}
 
 		sec, err := c.Logical().Read(envVar.secret)
 
 		if err != nil {
-			seelog.Errorf("[vault] - rrror reading %v: %v", envVar.secret, err)
+			ferr = fmt.Errorf("[vault] - error reading %v: %v", envVar.secret, err)
+			seelog.Errorf("%v", ferr)
 			continue
 		}
 
 		if sec == nil {
-			seelog.Errorf("[vault] - secret not found: %v", envVar.secret)
+			ferr = fmt.Errorf("[vault] - secret not found: %v", envVar.secret)
+			seelog.Errorf("%v", ferr)
 			continue
 		}
 
@@ -160,11 +163,12 @@ func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials
 		if(ok) {
 			envVars[varName] = fmt.Sprintf("%v", newVal)
 		} else {
-			seelog.Errorf("[vault] - field %v not found in secret %v", envVar.field, envVar.secret)
+			ferr = fmt.Errorf("[vault] - field %v not found in secret %v", envVar.field, envVar.secret)
+			seelog.Errorf("%v", ferr)
 		}
 
 	}
 
-	return envVars, nil
+	return envVars, ferr
 
 }

@@ -203,6 +203,10 @@ func (task *Task) initializeCredentialsEndpoint(credentialsManager credentials.M
 			envvars, err := vault.SubstituteSecrets(container.Environment, creds)
 			if err != nil {
 				seelog.Error(err)
+				_, skip_error := container.Environment["vault_skip_error"]
+                                if(!skip_error) {
+	                                task.SetDesiredStatus(TaskStopped)
+				}
 			}
 			container.Environment = envvars
 		}
