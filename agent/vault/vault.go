@@ -118,6 +118,24 @@ func auth(c *api.Client, creds *credentials.Credentials, vaultRole string) error
 //
 // Errors are attempted to be handled gracefully by just not substituting the value.
 func SubstituteSecrets(envVars map[string]string, creds *credentials.Credentials) (returnVars map[string]string, ferr error) {
+
+	// Check to make sure we have any secrets we need to do anything with
+
+	var needToAuth = false;
+
+	for _, vv := range envVars {
+               match, _ := regexp.MatchString("^vault://", vv)
+                if !match {
+                        continue
+                }
+		needToAuth = true
+		break
+	}
+
+	if(!needToAuth) {
+		return envVars, nil
+	}
+
 	c := apiClient()
 
 	if c == nil {
