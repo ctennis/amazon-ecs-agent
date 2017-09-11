@@ -27,6 +27,8 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
+	"github.com/aws/amazon-ecs-agent/agent/vault"
+	awscredentials "github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/private/protocol/json/jsonutil"
 	"github.com/cihub/seelog"
 	"github.com/fsouza/go-dockerclient"
@@ -194,6 +196,19 @@ func (task *Task) initializeCredentialsEndpoint(credentialsManager credentials.M
 		// config. Check if that's the case and initilialize if needed
 		if container.Environment == nil {
 			container.Environment = make(map[string]string)
+		} else {
+			creds := awscredentials.NewStaticCredentials(taskCredentials.IAMRoleCredentials.AccessKeyID,
+				taskCredentials.IAMRoleCredentials.SecretAccessKey, taskCredentials.IAMRoleCredentials.SessionToken)
+
+			envvars, err := vault.SubstituteSecrets(container.Environment, creds)
+			if err != nil {
+				seelog.Error(err)
+				_, skip_error := container.Environment["vault_skip_error"]
+                                if(!skip_error) {
+	                                task.SetDesiredStatus(TaskStopped)
+				}
+			}
+			container.Environment = envvars
 		}
 		container.Environment[awsSDKCredentialsRelativeURIPathEnvironmentVariableName] = credentialsEndpointRelativeURI
 	}
