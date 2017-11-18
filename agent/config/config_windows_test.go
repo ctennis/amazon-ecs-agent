@@ -25,6 +25,8 @@ import (
 )
 
 func TestConfigDefault(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Unsetenv("ECS_DISABLE_METRICS")
 	os.Unsetenv("ECS_RESERVED_PORTS")
 	os.Unsetenv("ECS_RESERVED_MEMORY")
@@ -40,9 +42,10 @@ func TestConfigDefault(t *testing.T) {
 	os.Unsetenv("ECS_NUM_IMAGES_DELETE_PER_CYCLE")
 	os.Unsetenv("ECS_IMAGE_MINIMUM_CLEANUP_AGE")
 	os.Unsetenv("ECS_IMAGE_CLEANUP_INTERVAL")
+	os.Unsetenv("ECS_HOST_DATA_DIR")
 
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	assert.Equal(t, "npipe:////./pipe/docker_engine", cfg.DockerEndpoint, "Default docker endpoint set incorrectly")
 	assert.Equal(t, `C:\ProgramData\Amazon\ECS\data`, cfg.DataDir, "Default datadir set incorrectly")
@@ -51,7 +54,8 @@ func TestConfigDefault(t *testing.T) {
 	assert.Equal(t, uint16(0), cfg.ReservedMemory, "Default reserved memory set incorrectly")
 	assert.Equal(t, 30*time.Second, cfg.DockerStopTimeout, "Default docker stop container timeout set incorrectly")
 	assert.False(t, cfg.PrivilegedDisabled, "Default PrivilegedDisabled set incorrectly")
-	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JSONFileDriver}, cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
+	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JSONFileDriver, dockerclient.NoneDriver},
+		cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
 	assert.Equal(t, 3*time.Hour, cfg.TaskCleanupWaitDuration, "Default task cleanup wait duration set incorrectly")
 	assert.False(t, cfg.TaskIAMRoleEnabled, "TaskIAMRoleEnabled set incorrectly")
 	assert.False(t, cfg.TaskIAMRoleEnabledForNetworkHost, "TaskIAMRoleEnabledForNetworkHost set incorrectly")
@@ -61,13 +65,16 @@ func TestConfigDefault(t *testing.T) {
 	assert.Equal(t, DefaultImageDeletionAge, cfg.MinimumImageDeletionAge, "MinimumImageDeletionAge default is set incorrectly")
 	assert.Equal(t, DefaultImageCleanupTimeInterval, cfg.ImageCleanupInterval, "ImageCleanupInterval default is set incorrectly")
 	assert.Equal(t, DefaultNumImagesToDeletePerCycle, cfg.NumImagesToDeletePerCycle, "NumImagesToDeletePerCycle default is set incorrectly")
+	assert.Equal(t, `C:\ProgramData\Amazon\ECS\data`, cfg.DataDirOnHost, "Default DataDirOnHost set incorrectly")
 }
 
 func TestConfigIAMTaskRolesReserves80(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Unsetenv("ECS_RESERVED_PORTS")
 	os.Setenv("ECS_ENABLE_TASK_IAM_ROLE", "true")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, []uint16{
 		DockerReservedPort,
 		DockerReservedSSLPort,

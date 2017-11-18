@@ -15,25 +15,25 @@
 package engine
 
 import (
-	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/eventstream"
-	"github.com/aws/amazon-ecs-agent/agent/statechange"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
+	docker "github.com/fsouza/go-dockerclient"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/net/context"
 )
 
@@ -82,37 +82,64 @@ func setup(cfg *config.Config, t *testing.T) (TaskEngine, func(), credentials.Ma
 	state := dockerstate.NewTaskEngineState()
 	imageManager := NewImageManager(cfg, dockerClient, state)
 	imageManager.SetSaver(statemanager.NewNoopStateManager())
+	metadataManager := containermetadata.NewManager(dockerClient, cfg)
+
 	taskEngine := NewDockerTaskEngine(cfg, dockerClient, credentialsManager,
-		eventstream.NewEventStream("ENGINEINTEGTEST", context.Background()), imageManager, state)
+		eventstream.NewEventStream("ENGINEINTEGTEST", context.Background()), imageManager, state, metadataManager)
 	taskEngine.Init(context.TODO())
 	return taskEngine, func() {
 		taskEngine.Shutdown()
 	}, credentialsManager
 }
 
-func discardEvents(from interface{}) func() {
-	done := make(chan bool)
+// TestDockerStateToContainerState tests convert the container status from
+// docker inspect to the status defined in agent
+func TestDockerStateToContainerState(t *testing.T) {
+	taskEngine, done, _ := setupWithDefaultConfig(t)
+	defer done()
 
-	go func() {
-		for {
-			ndx, _, _ := reflect.Select([]reflect.SelectCase{
-				{
-					Dir:  reflect.SelectRecv,
-					Chan: reflect.ValueOf(from),
-				},
-				{
-					Dir:  reflect.SelectRecv,
-					Chan: reflect.ValueOf(done),
-				},
-			})
-			if ndx == 1 {
-				break
-			}
-		}
-	}()
-	return func() {
-		done <- true
-	}
+	testTask := createTestTask("test_task")
+	container := testTask.Containers[0]
+
+	client, err := docker.NewClientFromEnv()
+	require.NoError(t, err, "Creating go docker client failed")
+
+	containerMetadata := taskEngine.(*DockerTaskEngine).pullContainer(testTask, container)
+	assert.NoError(t, containerMetadata.Error)
+
+	containerMetadata = taskEngine.(*DockerTaskEngine).createContainer(testTask, container)
+	assert.NoError(t, containerMetadata.Error)
+	state, _ := client.InspectContainer(containerMetadata.DockerID)
+	assert.Equal(t, api.ContainerCreated, dockerStateToState(state.State))
+
+	containerMetadata = taskEngine.(*DockerTaskEngine).startContainer(testTask, container)
+	assert.NoError(t, containerMetadata.Error)
+	state, _ = client.InspectContainer(containerMetadata.DockerID)
+	assert.Equal(t, api.ContainerRunning, dockerStateToState(state.State))
+
+	containerMetadata = taskEngine.(*DockerTaskEngine).stopContainer(testTask, container)
+	assert.NoError(t, containerMetadata.Error)
+	state, _ = client.InspectContainer(containerMetadata.DockerID)
+	assert.Equal(t, api.ContainerStopped, dockerStateToState(state.State))
+
+	// clean up the container
+	err = taskEngine.(*DockerTaskEngine).removeContainer(testTask, container)
+	assert.NoError(t, err, "remove the created container failed")
+
+	// Start the container failed
+	testTask = createTestTask("test_task2")
+	testTask.Containers[0].EntryPoint = &[]string{"non-existed"}
+	container = testTask.Containers[0]
+	containerMetadata = taskEngine.(*DockerTaskEngine).createContainer(testTask, container)
+	assert.NoError(t, containerMetadata.Error)
+	containerMetadata = taskEngine.(*DockerTaskEngine).startContainer(testTask, container)
+	assert.Error(t, containerMetadata.Error)
+	state, _ = client.InspectContainer(containerMetadata.DockerID)
+	assert.Equal(t, api.ContainerStopped, dockerStateToState(state.State))
+
+	// clean up the container
+	err = taskEngine.(*DockerTaskEngine).removeContainer(testTask, container)
+	assert.NoError(t, err, "remove the created container failed")
 }
 
 func TestHostVolumeMount(t *testing.T) {
@@ -254,57 +281,4 @@ func TestStartStopWithCredentials(t *testing.T) {
 	// credentials id set in the task
 	_, ok := credentialsManager.GetTaskCredentials(credentialsIDIntegTest)
 	assert.False(t, ok, "Credentials not removed from credentials manager for stopped task")
-}
-
-func verifyTaskIsRunning(stateChangeEvents <-chan statechange.Event, testTasks ...*api.Task) error {
-	for {
-		select {
-		case event := <-stateChangeEvents:
-			if event.GetEventType() == statechange.TaskEvent {
-				taskEvent := event.(api.TaskStateChange)
-				for i, task := range testTasks {
-					if taskEvent.TaskArn != task.Arn {
-						continue
-					}
-					if taskEvent.Status == api.TaskRunning {
-						if len(testTasks) == 1 {
-							return nil
-						}
-						testTasks = append(testTasks[:i], testTasks[i+1:]...)
-					} else if taskEvent.Status > api.TaskRunning {
-						return fmt.Errorf("Task went straight to %s without running, task: %s", taskEvent.Status.String(), task.Arn)
-					}
-				}
-			}
-		}
-	}
-}
-
-func verifyTaskIsStopped(stateChangeEvents <-chan statechange.Event, testTasks ...*api.Task) {
-	for {
-		select {
-		case event := <-stateChangeEvents:
-			if event.GetEventType() == statechange.TaskEvent {
-				taskEvent := event.(api.TaskStateChange)
-				for i, task := range testTasks {
-					if taskEvent.TaskArn == task.Arn && taskEvent.Status >= api.TaskStopped {
-						if len(testTasks) == 1 {
-							return
-						}
-						testTasks = append(testTasks[:i], testTasks[i+1:]...)
-					}
-				}
-			}
-		}
-	}
-}
-
-// waitForTaskStoppedByCheckStatus verify the task is in stopped status by checking the KnownStatusUnsafe field of the task
-func waitForTaskStoppedByCheckStatus(task *api.Task) {
-	for {
-		if task.GetKnownStatus() == api.TaskStopped {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
 }

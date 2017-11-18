@@ -25,8 +25,9 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/tcs/client"
 	"github.com/aws/amazon-ecs-agent/agent/tcs/model/ecstcs"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
+	"github.com/aws/amazon-ecs-agent/agent/wsclient"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	log "github.com/cihub/seelog"
+	"github.com/cihub/seelog"
 )
 
 const (
@@ -35,8 +36,11 @@ const (
 	defaultPublishMetricsInterval = 20 * time.Second
 
 	// The maximum time to wait between heartbeats without disconnecting
-	defaultHeartbeatTimeout            = 5 * time.Minute
-	defaultHeartbeatJitter             = 3 * time.Minute
+	defaultHeartbeatTimeout = 1 * time.Minute
+	defaultHeartbeatJitter  = 1 * time.Minute
+	// wsRWTimeout is the duration of read and write deadline for the
+	// websocket connection
+	wsRWTimeout                        = 2*defaultHeartbeatTimeout + defaultHeartbeatJitter
 	deregisterContainerInstanceHandler = "TCSDeregisterContainerInstanceHandler"
 )
 
@@ -45,7 +49,7 @@ const (
 func StartMetricsSession(params TelemetrySessionParams) {
 	disabled, err := params.isTelemetryDisabled()
 	if err != nil {
-		log.Warnf("Error getting telemetry config: %v", err)
+		seelog.Warnf("Error getting telemetry config: %v", err)
 		return
 	}
 
@@ -53,16 +57,16 @@ func StartMetricsSession(params TelemetrySessionParams) {
 		statsEngine := stats.NewDockerStatsEngine(params.Cfg, params.DockerClient, params.ContainerChangeEventStream)
 		err := statsEngine.MustInit(params.TaskEngine, params.Cfg.Cluster, params.ContainerInstanceArn)
 		if err != nil {
-			log.Warnf("Error initializing metrics engine: %v", err)
+			seelog.Warnf("Error initializing metrics engine: %v", err)
 			return
 		}
 		err = StartSession(params, statsEngine)
 		if err != nil {
-			log.Warnf("Error starting metrics session with backend: %v", err)
+			seelog.Warnf("Error starting metrics session with backend: %v", err)
 			return
 		}
 	} else {
-		log.Info("Metric collection disabled")
+		seelog.Info("Metric collection disabled")
 	}
 }
 
@@ -75,9 +79,10 @@ func StartSession(params TelemetrySessionParams, statsEngine stats.Engine) error
 	for {
 		tcsError := startTelemetrySession(params, statsEngine)
 		if tcsError == nil || tcsError == io.EOF {
+			seelog.Info("TCS Websocket connection closed for a valid reason")
 			backoff.Reset()
 		} else {
-			log.Infof("Error from tcs; backing off: %v", tcsError)
+			seelog.Infof("Error from tcs; backing off: %v", tcsError)
 			params.time().Sleep(backoff.Duration())
 		}
 	}
@@ -86,18 +91,24 @@ func StartSession(params TelemetrySessionParams, statsEngine stats.Engine) error
 func startTelemetrySession(params TelemetrySessionParams, statsEngine stats.Engine) error {
 	tcsEndpoint, err := params.ECSClient.DiscoverTelemetryEndpoint(params.ContainerInstanceArn)
 	if err != nil {
-		log.Errorf("Unable to discover poll endpoint: ", err)
+		seelog.Errorf("Unable to discover poll endpoint: %v", err)
 		return err
 	}
-	log.Debugf("Connecting to TCS endpoint %v", tcsEndpoint)
 	url := formatURL(tcsEndpoint, params.Cfg.Cluster, params.ContainerInstanceArn)
-	return startSession(url, params.Cfg, params.CredentialProvider, statsEngine, defaultHeartbeatTimeout, defaultHeartbeatJitter, defaultPublishMetricsInterval, params.DeregisterInstanceEventStream)
+	return startSession(url, params.Cfg, params.CredentialProvider, statsEngine,
+		defaultHeartbeatTimeout, defaultHeartbeatJitter, defaultPublishMetricsInterval,
+		params.DeregisterInstanceEventStream)
 }
 
-func startSession(url string, cfg *config.Config, credentialProvider *credentials.Credentials,
-	statsEngine stats.Engine, heartbeatTimeout, heartbeatJitter, publishMetricsInterval time.Duration,
+func startSession(url string,
+	cfg *config.Config,
+	credentialProvider *credentials.Credentials,
+	statsEngine stats.Engine,
+	heartbeatTimeout, heartbeatJitter,
+	publishMetricsInterval time.Duration,
 	deregisterInstanceEventStream *eventstream.EventStream) error {
-	client := tcsclient.New(url, cfg, credentialProvider, statsEngine, publishMetricsInterval)
+	client := tcsclient.New(url, cfg, credentialProvider, statsEngine,
+		publishMetricsInterval, wsRWTimeout)
 	defer client.Close()
 
 	err := deregisterInstanceEventStream.Subscribe(deregisterContainerInstanceHandler, client.Disconnect)
@@ -106,30 +117,32 @@ func startSession(url string, cfg *config.Config, credentialProvider *credential
 	}
 	defer deregisterInstanceEventStream.Unsubscribe(deregisterContainerInstanceHandler)
 
+	err = client.Connect()
+	if err != nil {
+		seelog.Errorf("Error connecting to TCS: %v", err.Error())
+		return err
+	}
+	seelog.Info("Connected to TCS endpoint")
 	// start a timer and listens for tcs heartbeats/acks. The timer is reset when
 	// we receive a heartbeat from the server or when a publish metrics message
 	// is acked.
 	timer := time.AfterFunc(utils.AddJitter(heartbeatTimeout, heartbeatJitter), func() {
 		// Close the connection if there haven't been any messages received from backend
 		// for a long time.
-		log.Debug("TCS Connection hasn't had a heartbeat or an ack message in too long of a timeout; disconnecting")
+		seelog.Info("TCS Connection hasn't had any activity for too long; disconnecting")
 		client.Disconnect()
 	})
 	defer timer.Stop()
 	client.AddRequestHandler(heartbeatHandler(timer))
 	client.AddRequestHandler(ackPublishMetricHandler(timer))
-	err = client.Connect()
-	if err != nil {
-		log.Errorf("Error connecting to TCS: %v", err.Error())
-		return err
-	}
+	client.SetAnyRequestHandler(anyMessageHandler(client))
 	return client.Serve()
 }
 
 // heartbeatHandler resets the heartbeat timer when HeartbeatMessage message is received from tcs.
 func heartbeatHandler(timer *time.Timer) func(*ecstcs.HeartbeatMessage) {
 	return func(*ecstcs.HeartbeatMessage) {
-		log.Debug("Received HeartbeatMessage from tcs")
+		seelog.Debug("Received HeartbeatMessage from tcs")
 		timer.Reset(utils.AddJitter(defaultHeartbeatTimeout, defaultHeartbeatJitter))
 	}
 }
@@ -138,8 +151,20 @@ func heartbeatHandler(timer *time.Timer) func(*ecstcs.HeartbeatMessage) {
 // the ack each time it processes a metric message.
 func ackPublishMetricHandler(timer *time.Timer) func(*ecstcs.AckPublishMetric) {
 	return func(*ecstcs.AckPublishMetric) {
-		log.Debug("Received AckPublishMetric from tcs")
+		seelog.Debug("Received AckPublishMetric from tcs")
 		timer.Reset(utils.AddJitter(defaultHeartbeatTimeout, defaultHeartbeatJitter))
+	}
+}
+
+// anyMessageHandler handles any server message. Any server message means the
+// connection is active
+func anyMessageHandler(client wsclient.ClientServer) func(interface{}) {
+	return func(interface{}) {
+		seelog.Trace("TCS activity occurred")
+		// Reset read deadline as there's activity on the channel
+		if err := client.SetReadDeadline(time.Now().Add(wsRWTimeout)); err != nil {
+			seelog.Warnf("Unable to extend read deadline for TCS connection: %v", err)
+		}
 	}
 }
 

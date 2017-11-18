@@ -23,11 +23,14 @@ import (
 
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
+	cnitypes "github.com/containernetworking/cni/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestConfigDefault(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Unsetenv("ECS_DISABLE_METRICS")
 	os.Unsetenv("ECS_RESERVED_PORTS")
 	os.Unsetenv("ECS_RESERVED_MEMORY")
@@ -43,9 +46,13 @@ func TestConfigDefault(t *testing.T) {
 	os.Unsetenv("ECS_NUM_IMAGES_DELETE_PER_CYCLE")
 	os.Unsetenv("ECS_IMAGE_MINIMUM_CLEANUP_AGE")
 	os.Unsetenv("ECS_IMAGE_CLEANUP_INTERVAL")
+	os.Unsetenv("ECS_ENABLE_TASK_ENI")
+	os.Unsetenv("ECS_CNI_PLUGINS_PATH")
+	os.Unsetenv("ECS_AWSVPC_BLOCK_IMDS")
+	os.Unsetenv("ECS_HOST_DATA_DIR")
 
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	assert.Equal(t, "unix:///var/run/docker.sock", cfg.DockerEndpoint, "Default docker endpoint set incorrectly")
 	assert.Equal(t, "/data/", cfg.DataDir, "Default datadir set incorrectly")
@@ -54,8 +61,10 @@ func TestConfigDefault(t *testing.T) {
 	assert.Equal(t, uint16(0), cfg.ReservedMemory, "Default reserved memory set incorrectly")
 	assert.Equal(t, 30*time.Second, cfg.DockerStopTimeout, "Default docker stop container timeout set incorrectly")
 	assert.False(t, cfg.PrivilegedDisabled, "Default PrivilegedDisabled set incorrectly")
-	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JSONFileDriver}, cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
+	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.JSONFileDriver, dockerclient.NoneDriver},
+		cfg.AvailableLoggingDrivers, "Default logging drivers set incorrectly")
 	assert.Equal(t, 3*time.Hour, cfg.TaskCleanupWaitDuration, "Default task cleanup wait duration set incorrectly")
+	assert.False(t, cfg.TaskENIEnabled, "TaskENIEnabled set incorrectly")
 	assert.False(t, cfg.TaskIAMRoleEnabled, "TaskIAMRoleEnabled set incorrectly")
 	assert.False(t, cfg.TaskIAMRoleEnabledForNetworkHost, "TaskIAMRoleEnabledForNetworkHost set incorrectly")
 	assert.False(t, cfg.CredentialsAuditLogDisabled, "CredentialsAuditLogDisabled set incorrectly")
@@ -64,6 +73,9 @@ func TestConfigDefault(t *testing.T) {
 	assert.Equal(t, DefaultImageDeletionAge, cfg.MinimumImageDeletionAge, "MinimumImageDeletionAge default is set incorrectly")
 	assert.Equal(t, DefaultImageCleanupTimeInterval, cfg.ImageCleanupInterval, "ImageCleanupInterval default is set incorrectly")
 	assert.Equal(t, DefaultNumImagesToDeletePerCycle, cfg.NumImagesToDeletePerCycle, "NumImagesToDeletePerCycle default is set incorrectly")
+	assert.Equal(t, defaultCNIPluginsPath, cfg.CNIPluginsPath, "CNIPluginsPath default is set incorrectly")
+	assert.False(t, cfg.AWSVPCBlockInstanceMetdata, "AWSVPCBlockInstanceMetdata default is incorrectly set")
+	assert.Equal(t, "/var/lib/ecs", cfg.DataDirOnHost, "Default DataDirOnHost set incorrectly")
 }
 
 // TestConfigFromFile tests the configuration can be read from file
@@ -76,7 +88,10 @@ func TestConfigFromFile(t *testing.T) {
     "email":"email"
   }
 }`
-	configContent := fmt.Sprintf(`{
+	testPauseImageName := "pause-image-name"
+	testPauseTag := "pause-image-tag"
+	content := fmt.Sprintf(`{
+  "AWSRegion": "not-real-1",
   "Cluster": "%s",
   "EngineAuthType": "%s",
   "EngineAuthData": %s,
@@ -84,22 +99,32 @@ func TestConfigFromFile(t *testing.T) {
   "TaskIAMRoleEnabled": true,
   "InstanceAttributes": {
     "attribute1": "value1"
-  }
-}`, cluster, dockerAuthType, dockerAuth)
+  },
+  "PauseContainerImageName":"%s",
+  "PauseContainerTag":"%s",
+  "AWSVPCAdditionalLocalRoutes":["169.254.172.1/32"]
+}`, cluster, dockerAuthType, dockerAuth, testPauseImageName, testPauseTag)
 
-	configFile := setupDockerAuthConfiguration(t, configContent)
-	defer os.Remove(configFile)
+	filePath := setupFileConfiguration(t, content)
+	defer os.Remove(filePath)
 
-	os.Setenv("ECS_AGENT_CONFIG_FILE_PATH", configFile)
+	os.Setenv("ECS_AGENT_CONFIG_FILE_PATH", filePath)
 	defer os.Unsetenv("ECS_AGENT_CONFIG_FILE_PATH")
 
-	config, err := fileConfig()
+	cfg, err := fileConfig()
 	assert.NoError(t, err, "reading configuration from file failed")
 
-	assert.Equal(t, cluster, config.Cluster, "cluster name not as expected from file")
-	assert.Equal(t, dockerAuthType, config.EngineAuthType, "docker auth type not as expected from file")
-	assert.Equal(t, dockerAuth, string(config.EngineAuthData.Contents()), "docker auth data not as expected from file")
-	assert.Equal(t, map[string]string{"attribute1": "value1"}, config.InstanceAttributes)
+	assert.Equal(t, cluster, cfg.Cluster, "cluster name not as expected from file")
+	assert.Equal(t, dockerAuthType, cfg.EngineAuthType, "docker auth type not as expected from file")
+	assert.Equal(t, dockerAuth, string(cfg.EngineAuthData.Contents()), "docker auth data not as expected from file")
+	assert.Equal(t, map[string]string{"attribute1": "value1"}, cfg.InstanceAttributes)
+	assert.Equal(t, testPauseImageName, cfg.PauseContainerImageName, "should read PauseContainerImageName")
+	assert.Equal(t, testPauseTag, cfg.PauseContainerTag, "should read PauseContainerTag")
+	assert.Equal(t, 1, len(cfg.AWSVPCAdditionalLocalRoutes), "should have one additional local route")
+	expectedLocalRoute, err := cnitypes.ParseCIDR("169.254.172.1/32")
+	assert.NoError(t, err)
+	assert.Equal(t, expectedLocalRoute.IP, cfg.AWSVPCAdditionalLocalRoutes[0].IP, "should match expected route IP")
+	assert.Equal(t, expectedLocalRoute.Mask, cfg.AWSVPCAdditionalLocalRoutes[0].Mask, "should match expected route Mask")
 }
 
 // TestDockerAuthMergeFromFile tests docker auth read from file correctly after merge
@@ -112,7 +137,8 @@ func TestDockerAuthMergeFromFile(t *testing.T) {
     "email":"email"
   }
 }`
-	configContent := fmt.Sprintf(`{
+	content := fmt.Sprintf(`{
+  "AWSRegion": "not-real-1",
   "Cluster": "TestCluster",
   "EngineAuthType": "%s",
   "EngineAuthData": %s,
@@ -123,30 +149,56 @@ func TestDockerAuthMergeFromFile(t *testing.T) {
   }
 }`, dockerAuthType, dockerAuth)
 
-	configFile := setupDockerAuthConfiguration(t, configContent)
-	defer os.Remove(configFile)
+	filePath := setupFileConfiguration(t, content)
+	defer os.Remove(filePath)
 
 	os.Setenv("ECS_CLUSTER", cluster)
-	os.Setenv("ECS_AGENT_CONFIG_FILE_PATH", configFile)
+	os.Setenv("ECS_AGENT_CONFIG_FILE_PATH", filePath)
 	defer os.Unsetenv("ECS_CLUSTER")
 	defer os.Unsetenv("ECS_AGENT_CONFIG_FILE_PATH")
 
-	config, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	assert.NoError(t, err, "create configuration failed")
 
-	assert.Equal(t, cluster, config.Cluster, "cluster name not as expected from environment variable")
-	assert.Equal(t, dockerAuthType, config.EngineAuthType, "docker auth type not as expected from file")
-	assert.Equal(t, dockerAuth, string(config.EngineAuthData.Contents()), "docker auth data not as expected from file")
-	assert.Equal(t, map[string]string{"attribute1": "value1"}, config.InstanceAttributes)
+	assert.Equal(t, cluster, cfg.Cluster, "cluster name not as expected from environment variable")
+	assert.Equal(t, dockerAuthType, cfg.EngineAuthType, "docker auth type not as expected from file")
+	assert.Equal(t, dockerAuth, string(cfg.EngineAuthData.Contents()), "docker auth data not as expected from file")
+	assert.Equal(t, map[string]string{"attribute1": "value1"}, cfg.InstanceAttributes)
 }
 
-// setupDockerAuthConfiguration create a temp file store the configuration
-func setupDockerAuthConfiguration(t *testing.T, configContent string) string {
-	configFile, err := ioutil.TempFile("", "ecs-test")
+func TestBadFileContent(t *testing.T) {
+	content := `{
+	"AWSRegion": "not-real-1",
+	"AWSVPCAdditionalLocalRoutes":["169.254.172.1/32", "300.300.300.300/32", "foo"]
+	}`
+
+	filePath := setupFileConfiguration(t, content)
+	defer os.Remove(filePath)
+
+	os.Setenv("ECS_AGENT_CONFIG_FILE_PATH", filePath)
+	defer os.Unsetenv("ECS_AGENT_CONFIG_FILE_PATH")
+
+	_, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	assert.Error(t, err, "create configuration should fail")
+}
+
+func TestShouldLoadPauseContainerTarball(t *testing.T) {
+	cfg := DefaultConfig()
+	assert.True(t, cfg.ShouldLoadPauseContainerTarball(), "should load tarball by default")
+	cfg.PauseContainerTag = "foo!"
+	assert.False(t, cfg.ShouldLoadPauseContainerTarball(), "should not load tarball if tag differs")
+	cfg = DefaultConfig()
+	cfg.PauseContainerImageName = "foo!"
+	assert.False(t, cfg.ShouldLoadPauseContainerTarball(), "should not load tarball if image name differs")
+}
+
+// setupFileConfiguration create a temp file store the configuration
+func setupFileConfiguration(t *testing.T, configContent string) string {
+	file, err := ioutil.TempFile("", "ecs-test")
 	require.NoError(t, err, "creating temp file for configuration failed")
 
-	_, err = configFile.Write([]byte(configContent))
+	_, err = file.Write([]byte(configContent))
 	require.NoError(t, err, "writing configuration to file failed")
 
-	return configFile.Name()
+	return file.Name()
 }

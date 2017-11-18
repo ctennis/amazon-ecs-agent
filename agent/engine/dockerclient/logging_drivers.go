@@ -24,6 +24,8 @@ const (
 	AWSLogsDriver    LoggingDriver = "awslogs"
 	SplunklogsDriver LoggingDriver = "splunk"
 	LogentriesDriver LoggingDriver = "logentries"
+	SumoLogicDriver  LoggingDriver = "sumologic"
+	NoneDriver       LoggingDriver = "none"
 )
 
 var LoggingDriverMinimumVersion = map[LoggingDriver]DockerVersion{
@@ -35,4 +37,6 @@ var LoggingDriverMinimumVersion = map[LoggingDriver]DockerVersion{
 	AWSLogsDriver:    Version_1_21,
 	SplunklogsDriver: Version_1_22,
 	LogentriesDriver: Version_1_25,
+	SumoLogicDriver:  Version_1_29,
+	NoneDriver:       Version_1_19,
 }

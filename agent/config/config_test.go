@@ -14,6 +14,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"reflect"
@@ -23,8 +24,8 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/ec2/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 )
@@ -67,64 +68,96 @@ func TestBrokenEC2MetadataEndpoint(t *testing.T) {
 	mockEc2Metadata.EXPECT().InstanceIdentityDocument().Return(ec2metadata.EC2InstanceIdentityDocument{}, errors.New("err"))
 	os.Setenv("AWS_DEFAULT_REGION", "us-west-2")
 
-	config, err := NewConfig(mockEc2Metadata)
+	cfg, err := NewConfig(mockEc2Metadata)
 	if err != nil {
 		t.Fatal("Expected no error")
 	}
-	if config.AWSRegion != "us-west-2" {
-		t.Fatal("Wrong region: " + config.AWSRegion)
+	if cfg.AWSRegion != "us-west-2" {
+		t.Fatal("Wrong region: " + cfg.AWSRegion)
 	}
-	if config.APIEndpoint != "" {
+	if cfg.APIEndpoint != "" {
 		t.Fatal("Endpoint env variable not set; endpoint should be blank")
 	}
 }
 
 func TestEnvironmentConfig(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_CLUSTER", "myCluster")
+	defer os.Unsetenv("ECS_CLUSTER")
 	os.Setenv("ECS_RESERVED_PORTS_UDP", "[42,99]")
+	defer os.Unsetenv("ECS_RESERVED_PORTS_UDP")
 	os.Setenv("ECS_RESERVED_MEMORY", "20")
+	defer os.Unsetenv("ECS_RESERVED_MEMORY")
 	os.Setenv("ECS_CONTAINER_STOP_TIMEOUT", "60s")
+	defer os.Unsetenv("ECS_CONTAINER_STOP_TIMEOUT")
 	os.Setenv("ECS_AVAILABLE_LOGGING_DRIVERS", "[\""+string(dockerclient.SyslogDriver)+"\"]")
+	defer os.Unsetenv("ECS_AVAILABLE_LOGGING_DRIVERS")
 	os.Setenv("ECS_SELINUX_CAPABLE", "true")
+	defer os.Unsetenv("ECS_SELINUX_CAPABLE")
 	os.Setenv("ECS_APPARMOR_CAPABLE", "true")
+	defer os.Unsetenv("ECS_APPARMOR_CAPABLE")
 	os.Setenv("ECS_DISABLE_PRIVILEGED", "true")
+	defer os.Unsetenv("ECS_DISABLE_PRIVILEGED")
 	os.Setenv("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION", "90s")
+	defer os.Unsetenv("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION")
 	os.Setenv("ECS_ENABLE_TASK_IAM_ROLE", "true")
+	defer os.Unsetenv("ECS_ENABLE_TASK_IAM_ROLE")
 	os.Setenv("ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST", "true")
+	defer os.Unsetenv("ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST")
 	os.Setenv("ECS_DISABLE_IMAGE_CLEANUP", "true")
+	defer os.Unsetenv("ECS_DISABLE_IMAGE_CLEANUP")
 	os.Setenv("ECS_IMAGE_CLEANUP_INTERVAL", "2h")
+	defer os.Unsetenv("ECS_IMAGE_CLEANUP_INTERVAL")
 	os.Setenv("ECS_IMAGE_MINIMUM_CLEANUP_AGE", "30m")
+	defer os.Unsetenv("ECS_IMAGE_MINIMUM_CLEANUP_AGE")
 	os.Setenv("ECS_NUM_IMAGES_DELETE_PER_CYCLE", "2")
+	defer os.Unsetenv("ECS_NUM_IMAGES_DELETE_PER_CYCLE")
 	os.Setenv("ECS_INSTANCE_ATTRIBUTES", "{\"my_attribute\": \"testing\"}")
+	defer os.Unsetenv("ECS_INSTANCE_ATTRIBUTES")
+	os.Setenv("ECS_ENABLE_TASK_ENI", "true")
+	defer os.Unsetenv("ECS_ENABLE_TASK_ENI")
+	additionalLocalRoutesJSON := `["1.2.3.4/22","5.6.7.8/32"]`
+	os.Setenv("ECS_AWSVPC_ADDITIONAL_LOCAL_ROUTES", additionalLocalRoutesJSON)
+	defer os.Unsetenv("ECS_AWSVPC_ADDITIONAL_LOCAL_ROUTES")
+	os.Setenv("ECS_ENABLE_CONTAINER_METADATA", "true")
+	os.Setenv("ECS_HOST_DATA_DIR", "/etc/ecs/")
+	defer os.Unsetenv("ECS_ENABLE_CONTAINER_METADATA")
+	defer os.Unsetenv("ECS_HOST_DATA_DIR")
 
 	conf, err := environmentConfig()
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 	assert.Equal(t, "myCluster", conf.Cluster)
 	assert.Equal(t, 2, len(conf.ReservedPortsUDP))
 	assert.Contains(t, conf.ReservedPortsUDP, uint16(42))
 	assert.Contains(t, conf.ReservedPortsUDP, uint16(99))
 	assert.Equal(t, uint16(20), conf.ReservedMemory)
-
 	expectedDuration, _ := time.ParseDuration("60s")
 	assert.Equal(t, expectedDuration, conf.DockerStopTimeout)
-
 	assert.Equal(t, []dockerclient.LoggingDriver{dockerclient.SyslogDriver}, conf.AvailableLoggingDrivers)
-
 	assert.True(t, conf.PrivilegedDisabled)
 	assert.True(t, conf.SELinuxCapable, "Wrong value for SELinuxCapable")
 	assert.True(t, conf.AppArmorCapable, "Wrong value for AppArmorCapable")
 	assert.True(t, conf.TaskIAMRoleEnabled, "Wrong value for TaskIAMRoleEnabled")
 	assert.True(t, conf.TaskIAMRoleEnabledForNetworkHost, "Wrong value for TaskIAMRoleEnabledForNetworkHost")
 	assert.True(t, conf.ImageCleanupDisabled, "Wrong value for ImageCleanupDisabled")
-
-	assert.Equal(t, (30 * time.Minute), conf.MinimumImageDeletionAge)
-	assert.Equal(t, (2 * time.Hour), conf.ImageCleanupInterval)
+	assert.True(t, conf.TaskENIEnabled, "Wrong value for TaskNetwork")
+	assert.Equal(t, 30*time.Minute, conf.MinimumImageDeletionAge)
+	assert.Equal(t, 2*time.Hour, conf.ImageCleanupInterval)
 	assert.Equal(t, 2, conf.NumImagesToDeletePerCycle)
 	assert.Equal(t, "testing", conf.InstanceAttributes["my_attribute"])
+	assert.Equal(t, 90*time.Second, conf.TaskCleanupWaitDuration)
+	serializedAdditionalLocalRoutesJSON, err := json.Marshal(conf.AWSVPCAdditionalLocalRoutes)
+	assert.NoError(t, err, "should marshal additional local routes")
+	assert.Equal(t, additionalLocalRoutesJSON, string(serializedAdditionalLocalRoutesJSON))
 	assert.Equal(t, (90 * time.Second), conf.TaskCleanupWaitDuration)
+	assert.Equal(t, "/etc/ecs/", conf.DataDirOnHost, "Wrong value for DataDirOnHost")
+	assert.True(t, conf.ContainerMetadataEnabled, "Wrong value for ContainerMetadataEnabled")
 }
 
 func TestTrimWhitespace(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_CLUSTER", "default \r")
 	os.Setenv("ECS_ENGINE_AUTH_TYPE", "dockercfg\r")
 
@@ -151,6 +184,8 @@ func TestTrimWhitespace(t *testing.T) {
 }
 
 func TestConfigBoolean(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_DISABLE_METRICS", "true")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -208,7 +243,7 @@ func TestInvalideValueDockerStopTimeout(t *testing.T) {
 	assert.Zero(t, conf.DockerStopTimeout)
 }
 
-func TestInvalideDockerStopTimeout(t *testing.T) {
+func TestInvalidDockerStopTimeout(t *testing.T) {
 	conf := DefaultConfig()
 	conf.DockerStopTimeout = -1 * time.Second
 
@@ -251,6 +286,8 @@ func TestValidFormatParseEnvVariableDuration(t *testing.T) {
 }
 
 func TestInvalidTaskCleanupTimeout(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION", "1s")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -265,6 +302,8 @@ func TestInvalidTaskCleanupTimeout(t *testing.T) {
 }
 
 func TestTaskCleanupTimeout(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION", "10m")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -279,6 +318,8 @@ func TestTaskCleanupTimeout(t *testing.T) {
 }
 
 func TestInvalidReservedMemory(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_RESERVED_MEMORY", "-1")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -293,6 +334,8 @@ func TestInvalidReservedMemory(t *testing.T) {
 }
 
 func TestReservedMemory(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_RESERVED_MEMORY", "1")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -307,6 +350,8 @@ func TestReservedMemory(t *testing.T) {
 }
 
 func TestTaskIAMRoleEnabled(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_ENABLE_TASK_IAM_ROLE", "true")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -319,6 +364,8 @@ func TestTaskIAMRoleEnabled(t *testing.T) {
 }
 
 func TestTaskIAMRoleForHostNetworkEnabled(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST", "true")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -331,6 +378,8 @@ func TestTaskIAMRoleForHostNetworkEnabled(t *testing.T) {
 }
 
 func TestCredentialsAuditLogFile(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	dummyLocation := "/foo/bar.log"
 	os.Setenv("ECS_AUDIT_LOGFILE", dummyLocation)
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
@@ -344,6 +393,8 @@ func TestCredentialsAuditLogFile(t *testing.T) {
 }
 
 func TestCredentialsAuditLogDisabled(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_AUDIT_LOGFILE_DISABLED", "true")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -356,6 +407,8 @@ func TestCredentialsAuditLogDisabled(t *testing.T) {
 }
 
 func TestImageCleanupMinimumInterval(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_IMAGE_CLEANUP_INTERVAL", "1m")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -368,6 +421,8 @@ func TestImageCleanupMinimumInterval(t *testing.T) {
 }
 
 func TestImageCleanupMinimumNumImagesToDeletePerCycle(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
 	os.Setenv("ECS_NUM_IMAGES_DELETE_PER_CYCLE", "-1")
 	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
 	if err != nil {
@@ -377,4 +432,21 @@ func TestImageCleanupMinimumNumImagesToDeletePerCycle(t *testing.T) {
 	if cfg.NumImagesToDeletePerCycle != DefaultNumImagesToDeletePerCycle {
 		t.Errorf("Wrong value for NumImagesToDeletePerCycle: %v", cfg.NumImagesToDeletePerCycle)
 	}
+}
+
+func TestAWSVPCBlockInstanceMetadata(t *testing.T) {
+	os.Setenv("AWS_DEFAULT_REGION", "foo-bar-1")
+	defer os.Unsetenv("AWS_DEFAULT_REGION")
+	os.Setenv("ECS_AWSVPC_BLOCK_IMDS", "true")
+	defer os.Unsetenv("ECS_AWSVPC_BLOCK_IMDS")
+	cfg, err := NewConfig(ec2.NewBlackholeEC2MetadataClient())
+	assert.NoError(t, err)
+	assert.True(t, cfg.AWSVPCBlockInstanceMetdata)
+}
+
+func TestInvalidAWSVPCAdditionalLocalRoutes(t *testing.T) {
+	os.Setenv("ECS_AWSVPC_ADDITIONAL_LOCAL_ROUTES", `["300.300.300.300/64"]`)
+	defer os.Unsetenv("ECS_AWSVPC_ADDITIONAL_LOCAL_ROUTES")
+	_, err := environmentConfig()
+	assert.Error(t, err)
 }

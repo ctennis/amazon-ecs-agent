@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	steadyStateTaskVerifyInterval         = 10 * time.Minute
+	steadyStateTaskVerifyInterval         = 5 * time.Minute
 	stoppedSentWaitInterval               = 30 * time.Second
 	maxStoppedWaitTimes                   = 72 * time.Hour / stoppedSentWaitInterval
 	taskUnableToTransitionToStoppedReason = "TaskStateError: Agent could not progress task's state to stopped"
@@ -151,6 +151,8 @@ func (mtask *managedTask) overseeTask() {
 		llog.Debug("Marking done for this sequence", "seqnum", mtask.StopSequenceNumber)
 		mtask.engine.taskStopGroup.Done(mtask.StopSequenceNumber)
 	}
+	// TODO: make this idempotent on agent restart
+	go mtask.releaseIPInIPAM()
 	mtask.cleanupTask(mtask.engine.cfg.TaskCleanupWaitDuration)
 }
 
@@ -323,6 +325,19 @@ func (mtask *managedTask) handleContainerChange(containerChange dockerContainerC
 	}
 }
 
+// releaseIPInIPAM releases the ip used by the task for awsvpc
+func (mtask *managedTask) releaseIPInIPAM() {
+	if mtask.ENI == nil {
+		return
+	}
+	seelog.Infof("Releasing ip in IPAM for task used eni, task: %s", mtask.Task.Arn)
+
+	err := mtask.engine.releaseIPInIPAM(mtask.Task)
+	if err != nil {
+		seelog.Warnf("Releasing the ip in IPAM failed, task: [%s], err: %v", mtask.Task.Arn, err)
+	}
+}
+
 // handleStoppedToRunningContainerTransition detects a "backwards" container
 // transition where a known-stopped container is found to be running again and
 // handles it.
@@ -330,7 +345,7 @@ func (mtask *managedTask) handleStoppedToRunningContainerTransition(status api.C
 	llog := log.New("task", mtask.Task)
 	containerKnownStatus := container.GetKnownStatus()
 	if status <= containerKnownStatus && containerKnownStatus == api.ContainerStopped {
-		if status == api.ContainerRunning {
+		if status.IsRunning() {
 			// If the container becomes running after we've stopped it (possibly
 			// because we got an error running it and it ran anyways), the first time
 			// update it to 'known running' so that it will be driven back to stopped
@@ -412,7 +427,7 @@ func (mtask *managedTask) steadyState() bool {
 // docker completes.
 // Container changes may also prompt the task status to change as well.
 func (mtask *managedTask) progressContainers() {
-	seelog.Debug("Progressing task: %s", mtask.Task.String())
+	seelog.Debugf("Progressing task: %s", mtask.Task.String())
 	// max number of transitions length to ensure writes will never block on
 	// these and if we exit early transitions can exit the goroutine and it'll
 	// get GC'd eventually
@@ -435,7 +450,7 @@ func (mtask *managedTask) progressContainers() {
 	// complete, but keep reading events as we do.. in fact, we have to for
 	// transitions to complete
 	mtask.waitForContainerTransitions(transitions, transitionChange, transitionChangeContainer)
-	seelog.Debug("Done transitioning all containers for task %v", mtask.Task)
+	seelog.Debugf("Done transitioning all containers for task %v", mtask.Task)
 
 	// update the task status
 	changed := mtask.UpdateStatus()
@@ -504,12 +519,14 @@ func (mtask *managedTask) containerNextState(container *api.Container) (api.Cont
 	var nextState api.ContainerStatus
 	if container.DesiredTerminal() {
 		nextState = api.ContainerStopped
-		if containerKnownStatus != api.ContainerRunning {
+		// It's not enough to just check if container is in steady state here
+		// we should really check if >= RUNNING <= STOPPED
+		if !container.IsRunning() {
 			// If it's not currently running we do not need to do anything to make it become stopped.
 			return nextState, false, true
 		}
 	} else {
-		nextState = containerKnownStatus + 1
+		nextState = container.GetNextKnownStateProgression()
 	}
 	return nextState, true, true
 }
@@ -602,7 +619,14 @@ func (mtask *managedTask) cleanupTask(taskStoppedDuration time.Duration) {
 	// Now remove ourselves from the global state and cleanup channels
 	mtask.engine.processTasks.Lock()
 	mtask.engine.state.RemoveTask(mtask.Task)
-	seelog.Debug("Finished removing task data, removing task from managed tasks: %v", mtask.Task)
+	eni := mtask.Task.GetTaskENI()
+	if eni == nil {
+		seelog.Debugf("No eni associated with task: [%s]", mtask.Task.String())
+	} else {
+		seelog.Debugf("Removing the eni from agent state, task: [%s]", mtask.Task.String())
+		mtask.engine.state.RemoveENIAttachment(eni.MacAddress)
+	}
+	seelog.Debugf("Finished removing task data, removing task from managed tasks: %v", mtask.Task)
 	delete(mtask.engine.managedTasks, mtask.Arn)
 	handleCleanupDone <- struct{}{}
 	mtask.engine.processTasks.Unlock()

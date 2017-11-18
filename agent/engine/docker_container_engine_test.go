@@ -40,6 +40,7 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockeriface/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime/mocks"
+	"github.com/stretchr/testify/require"
 )
 
 // xContainerShortTimeout is a short duration intended to be used by the
@@ -90,15 +91,16 @@ func TestPullImageOutputTimeout(t *testing.T) {
 	defer done()
 
 	pullBeginTimeout := make(chan time.Time)
-	testTime.EXPECT().After(dockerPullBeginTimeout).Return(pullBeginTimeout)
-	testTime.EXPECT().After(pullImageTimeout)
+	testTime.EXPECT().After(dockerPullBeginTimeout).Return(pullBeginTimeout).MinTimes(1)
+	testTime.EXPECT().After(pullImageTimeout).MinTimes(1)
 	wait := sync.WaitGroup{}
 	wait.Add(1)
+	// multiple invocations will happen due to retries, but all should timeout
 	mockDocker.EXPECT().PullImage(&pullImageOptsMatcher{"image:latest"}, gomock.Any()).Do(func(x, y interface{}) {
 		pullBeginTimeout <- time.Now()
 		wait.Wait()
 		// Don't return, verify timeout happens
-	})
+	}).Times(maximumPullRetries) // expected number of retries
 
 	metadata := client.PullImage("image", nil)
 	if metadata.Error == nil {
@@ -159,9 +161,7 @@ func TestPullImage(t *testing.T) {
 	mockDocker.EXPECT().PullImage(&pullImageOptsMatcher{"image:latest"}, gomock.Any()).Return(nil)
 
 	metadata := client.PullImage("image", nil)
-	if metadata.Error != nil {
-		t.Error("Expected pull to succeed")
-	}
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
 }
 
 func TestPullImageTag(t *testing.T) {
@@ -172,9 +172,7 @@ func TestPullImageTag(t *testing.T) {
 	mockDocker.EXPECT().PullImage(&pullImageOptsMatcher{"image:mytag"}, gomock.Any()).Return(nil)
 
 	metadata := client.PullImage("image:mytag", nil)
-	if metadata.Error != nil {
-		t.Error("Expected pull to succeed")
-	}
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
 }
 
 func TestPullImageDigest(t *testing.T) {
@@ -188,50 +186,7 @@ func TestPullImageDigest(t *testing.T) {
 	).Return(nil)
 
 	metadata := client.PullImage("image@sha256:bc8813ea7b3603864987522f02a76101c17ad122e1c46d790efc0fca78ca7bfb", nil)
-	if metadata.Error != nil {
-		t.Error("Expected pull to succeed")
-	}
-}
-
-func TestPullEmptyvolumeImage(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
-	defer done()
-
-	// The special emptyvolume image leads to a create, not pull
-	testTime.EXPECT().After(gomock.Any()).AnyTimes()
-	gomock.InOrder(
-		mockDocker.EXPECT().InspectImage(emptyvolume.Image+":"+emptyvolume.Tag).Return(nil, errors.New("Does not exist")),
-		mockDocker.EXPECT().ImportImage(gomock.Any()).Do(func(x interface{}) {
-			req := x.(docker.ImportImageOptions)
-			if req.Repository != emptyvolume.Image {
-				t.Fatal("Expected empty volume repository")
-			}
-			if req.Tag != emptyvolume.Tag {
-				t.Fatal("Expected empty volume repository")
-			}
-		}),
-	)
-
-	metadata := client.PullImage(emptyvolume.Image+":"+emptyvolume.Tag, nil)
-	if metadata.Error != nil {
-		t.Error(metadata.Error)
-	}
-}
-
-func TestPullExistingEmptyvolumeImage(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
-	defer done()
-
-	// The special emptyvolume image leads to a create only if it doesn't exist
-	testTime.EXPECT().After(gomock.Any()).AnyTimes()
-	gomock.InOrder(
-		mockDocker.EXPECT().InspectImage(emptyvolume.Image+":"+emptyvolume.Tag).Return(&docker.Image{}, nil),
-	)
-
-	metadata := client.PullImage(emptyvolume.Image+":"+emptyvolume.Tag, nil)
-	if metadata.Error != nil {
-		t.Error(metadata.Error)
-	}
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
 }
 
 func TestPullImageECRSuccess(t *testing.T) {
@@ -285,9 +240,7 @@ func TestPullImageECRSuccess(t *testing.T) {
 	).Return(nil)
 
 	metadata := client.PullImage(image, authData)
-	if metadata.Error != nil {
-		t.Error("Expected pull to succeed")
-	}
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
 }
 
 func TestPullImageECRAuthFail(t *testing.T) {
@@ -322,12 +275,44 @@ func TestPullImageECRAuthFail(t *testing.T) {
 	image := imageEndpoint + "/myimage:tag"
 
 	ecrClientFactory.EXPECT().GetClient(region, endpointOverride).Return(ecrClient)
+	// no retries for this error
 	ecrClient.EXPECT().GetAuthorizationToken(gomock.Any()).Return(nil, errors.New("test error"))
 
 	metadata := client.PullImage(image, authData)
-	if metadata.Error == nil {
-		t.Error("Expected pull to fail")
-	}
+	assert.Error(t, metadata.Error, "expected pull to fail")
+}
+
+func TestImportLocalEmptyVolumeImage(t *testing.T) {
+	mockDocker, client, testTime, done := dockerClientSetup(t)
+	defer done()
+
+	// The special emptyvolume image leads to a create, not pull
+	testTime.EXPECT().After(gomock.Any()).AnyTimes()
+	gomock.InOrder(
+		mockDocker.EXPECT().InspectImage(emptyvolume.Image+":"+emptyvolume.Tag).Return(nil, errors.New("Does not exist")),
+		mockDocker.EXPECT().ImportImage(gomock.Any()).Do(func(x interface{}) {
+			req := x.(docker.ImportImageOptions)
+			require.Equal(t, emptyvolume.Image, req.Repository, "expected empty volume repository")
+			require.Equal(t, emptyvolume.Tag, req.Tag, "expected empty volume tag")
+		}),
+	)
+
+	metadata := client.ImportLocalEmptyVolumeImage()
+	assert.NoError(t, metadata.Error, "Expected import to succeed")
+}
+
+func TestImportLocalEmptyVolumeImageExisting(t *testing.T) {
+	mockDocker, client, testTime, done := dockerClientSetup(t)
+	defer done()
+
+	// The special emptyvolume image leads to a create only if it doesn't exist
+	testTime.EXPECT().After(gomock.Any()).AnyTimes()
+	gomock.InOrder(
+		mockDocker.EXPECT().InspectImage(emptyvolume.Image+":"+emptyvolume.Tag).Return(&docker.Image{}, nil),
+	)
+
+	metadata := client.ImportLocalEmptyVolumeImage()
+	assert.NoError(t, metadata.Error, "Expected import to succeed")
 }
 
 func TestCreateContainerTimeout(t *testing.T) {
@@ -344,12 +329,8 @@ func TestCreateContainerTimeout(t *testing.T) {
 		// Don't return, verify timeout happens
 	})
 	metadata := client.CreateContainer(config.Config, nil, config.Name, xContainerShortTimeout)
-	if metadata.Error == nil {
-		t.Error("Expected error for pull timeout")
-	}
-	if metadata.Error.(api.NamedError).ErrorName() != "DockerTimeoutError" {
-		t.Error("Wrong error type")
-	}
+	assert.Error(t, metadata.Error, "expected error for pull timeout")
+	assert.Equal(t, "DockerTimeoutError", metadata.Error.(api.NamedError).ErrorName())
 	wait.Done()
 }
 
@@ -601,7 +582,7 @@ func TestContainerEvents(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		anEvent := <-dockerEvents
-		if anEvent.DockerID != "cid3"+strconv.Itoa(i) {
+		if anEvent.DockerID != "cid30" && anEvent.DockerID != "cid31" {
 			t.Error("Wrong container id: " + anEvent.DockerID)
 		}
 		if anEvent.Status != api.ContainerStopped {
@@ -947,4 +928,31 @@ func TestContainerMetadataWorkaroundIssue27601(t *testing.T) {
 	}, nil)
 	metadata := client.containerMetadata("id")
 	assert.Equal(t, map[string]string{"destination1": "source1", "destination2": "source2"}, metadata.Volumes)
+}
+
+func TestLoadImageHappyPath(t *testing.T) {
+	mockDocker, client, _, done := dockerClientSetup(t)
+	defer done()
+
+	mockDocker.EXPECT().LoadImage(gomock.Any()).Return(nil)
+
+	err := client.LoadImage(nil, time.Second)
+	assert.NoError(t, err)
+}
+
+func TestLoadImageTimeoutError(t *testing.T) {
+	mockDocker, client, _, done := dockerClientSetup(t)
+	defer done()
+
+	wait := sync.WaitGroup{}
+	wait.Add(1)
+	mockDocker.EXPECT().LoadImage(gomock.Any()).Do(func(x interface{}) {
+		wait.Wait()
+	})
+
+	err := client.LoadImage(nil, time.Millisecond)
+	assert.Error(t, err)
+	_, ok := err.(*DockerTimeoutError)
+	assert.True(t, ok)
+	wait.Done()
 }

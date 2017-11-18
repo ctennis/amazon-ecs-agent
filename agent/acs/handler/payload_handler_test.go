@@ -47,9 +47,10 @@ func TestHandlePayloadMessageWithNoMessageId(t *testing.T) {
 	ecsClient := mock_api.NewMockECSClient(ctrl)
 	stateManager := statemanager.NewNoopStateManager()
 	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler()
+	ctx, cancel := context.WithCancel(context.Background())
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	defer cancel()
 
-	ctx := context.Background()
 	buffer := newPayloadRequestHandler(
 		ctx,
 		taskEngine,
@@ -94,12 +95,13 @@ func TestHandlePayloadMessageAddTaskError(t *testing.T) {
 	ecsClient := mock_api.NewMockECSClient(ctrl)
 	stateManager := statemanager.NewNoopStateManager()
 	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler()
+	ctx, cancel := context.WithCancel(context.Background())
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	defer cancel()
 
 	// Return error from AddTask
 	taskEngine.EXPECT().AddTask(gomock.Any()).Return(fmt.Errorf("oops")).Times(2)
 
-	ctx := context.Background()
 	buffer := newPayloadRequestHandler(
 		ctx,
 		taskEngine,
@@ -150,9 +152,12 @@ func TestHandlePayloadMessageStateSaveError(t *testing.T) {
 	defer ctrl.Finish()
 	ecsClient := mock_api.NewMockECSClient(ctrl)
 	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler()
-
+	stateManager := mock_statemanager.NewMockStateManager(ctrl)
 	taskEngine := engine.NewMockTaskEngine(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	defer cancel()
+
 	// Save added task in the addedTask variable
 	var addedTask *api.Task
 	taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
@@ -160,10 +165,8 @@ func TestHandlePayloadMessageStateSaveError(t *testing.T) {
 	}).Times(1)
 
 	// State manager returns error on save
-	stateManager := mock_statemanager.NewMockStateManager(ctrl)
 	stateManager.EXPECT().Save().Return(fmt.Errorf("oops"))
 
-	ctx := context.Background()
 	buffer := newPayloadRequestHandler(
 		ctx,
 		taskEngine,
@@ -206,8 +209,8 @@ func TestHandlePayloadMessageAckedWhenTaskAdded(t *testing.T) {
 	ecsClient := mock_api.NewMockECSClient(ctrl)
 	stateManager := statemanager.NewNoopStateManager()
 	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler()
 	ctx, cancel := context.WithCancel(context.Background())
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
 
 	taskEngine := engine.NewMockTaskEngine(ctrl)
 	var addedTask *api.Task
@@ -277,7 +280,7 @@ func TestHandlePayloadMessageCredentialsAckedWhenTaskAdded(t *testing.T) {
 	stateManager := statemanager.NewNoopStateManager()
 	ctx, cancel := context.WithCancel(context.Background())
 	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler()
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
 
 	taskEngine := engine.NewMockTaskEngine(ctrl)
 	var addedTask *api.Task
@@ -391,7 +394,10 @@ func TestAddPayloadTaskAddsNonStoppedTasksAfterStoppedTasks(t *testing.T) {
 	ecsClient := mock_api.NewMockECSClient(ctrl)
 	taskEngine := engine.NewMockTaskEngine(ctrl)
 	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler()
+	stateManager := statemanager.NewNoopStateManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	defer cancel()
 
 	var tasksAddedToEngine []*api.Task
 	taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
@@ -414,8 +420,6 @@ func TestAddPayloadTaskAddsNonStoppedTasksAfterStoppedTasks(t *testing.T) {
 		MessageId: aws.String(payloadMessageId),
 	}
 
-	ctx := context.Background()
-	stateManager := statemanager.NewNoopStateManager()
 	buffer := newPayloadRequestHandler(
 		ctx,
 		taskEngine,
@@ -451,8 +455,8 @@ func TestPayloadBufferHandler(t *testing.T) {
 	ecsClient := mock_api.NewMockECSClient(ctrl)
 	stateManager := statemanager.NewNoopStateManager()
 	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler()
 	ctx, cancel := context.WithCancel(context.Background())
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
 
 	var addedTask *api.Task
 	taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
@@ -517,7 +521,7 @@ func TestPayloadBufferHandlerWithCredentials(t *testing.T) {
 	stateManager := statemanager.NewNoopStateManager()
 	ctx, cancel := context.WithCancel(context.Background())
 	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler()
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
 
 	// The payload message in the test consists of two tasks, record both of them in
 	// the order in which they were added
@@ -686,4 +690,74 @@ func validateTaskAndCredentials(taskCredentialsAck, expectedCredentialsAckForTas
 		return fmt.Errorf("Mismatch between expected and added tasks, expected: %v, added: %v", expectedTask, addedTask)
 	}
 	return nil
+}
+
+func TestPayloadHandlerAddedENIToTask(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ecsClient := mock_api.NewMockECSClient(ctrl)
+	stateManager := statemanager.NewNoopStateManager()
+	credentialsManager := credentials.NewManager()
+	ctx, cancel := context.WithCancel(context.Background())
+	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	defer cancel()
+
+	taskEngine := engine.NewMockTaskEngine(ctrl)
+	var addedTask *api.Task
+	taskEngine.EXPECT().AddTask(gomock.Any()).Do(
+		func(task *api.Task) {
+			addedTask = task
+		})
+
+	payloadMessage := &ecsacs.PayloadMessage{
+		Tasks: []*ecsacs.Task{
+			{
+				Arn: aws.String("arn"),
+				ElasticNetworkInterfaces: []*ecsacs.ElasticNetworkInterface{
+					{
+						AttachmentArn: aws.String("arn"),
+						Ec2Id:         aws.String("ec2id"),
+						Ipv4Addresses: []*ecsacs.IPv4AddressAssignment{
+							{
+								Primary:        aws.Bool(true),
+								PrivateAddress: aws.String("ipv4"),
+							},
+						},
+						Ipv6Addresses: []*ecsacs.IPv6AddressAssignment{
+							{
+								Address: aws.String("ipv6"),
+							},
+						},
+						MacAddress: aws.String("mac"),
+					},
+				},
+			},
+		},
+		MessageId: aws.String(payloadMessageId),
+	}
+
+	buffer := newPayloadRequestHandler(
+		ctx,
+		taskEngine,
+		ecsClient,
+		clusterName,
+		containerInstanceArn,
+		nil,
+		stateManager,
+		refreshCredentialsHandler{},
+		credentialsManager,
+		taskHandler)
+	err := buffer.handleSingleMessage(payloadMessage)
+	assert.NoError(t, err)
+
+	// Validate the added task has the eni information as expected
+	expectedENI := payloadMessage.Tasks[0].ElasticNetworkInterfaces[0]
+	taskeni := addedTask.GetTaskENI()
+	assert.Equal(t, aws.StringValue(expectedENI.Ec2Id), taskeni.ID)
+	assert.Equal(t, aws.StringValue(expectedENI.MacAddress), taskeni.MacAddress)
+	assert.Equal(t, 1, len(taskeni.IPV4Addresses))
+	assert.Equal(t, 1, len(taskeni.IPV6Addresses))
+	assert.Equal(t, aws.StringValue(expectedENI.Ipv4Addresses[0].PrivateAddress), taskeni.IPV4Addresses[0].Address)
+	assert.Equal(t, aws.StringValue(expectedENI.Ipv6Addresses[0].Address), taskeni.IPV6Addresses[0].Address)
 }

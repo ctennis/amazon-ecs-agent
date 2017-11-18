@@ -15,7 +15,6 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -24,7 +23,9 @@ import (
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
 	"github.com/aws/amazon-ecs-agent/agent/vault"
@@ -32,26 +33,28 @@ import (
 	"github.com/aws/aws-sdk-go/private/protocol/json/jsonutil"
 	"github.com/cihub/seelog"
 	"github.com/fsouza/go-dockerclient"
+	"github.com/pkg/errors"
 )
 
 const (
+	// PauseContainerName is the internal name for the pause container
+	PauseContainerName = "~internal~ecs~pause"
+
 	emptyHostVolumeName = "~internal~ecs-emptyvolume-source"
 
 	// awsSDKCredentialsRelativeURIPathEnvironmentVariableName defines the name of the environment
 	// variable containers' config, which will be used by the AWS SDK to fetch
 	// credentials.
 	awsSDKCredentialsRelativeURIPathEnvironmentVariableName = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+	// networkModeNone specifies the string used to define the `none` docker networking mode
+	networkModeNone = "none"
+	// networkModeContainerPrefix specifies the prefix string used for setting the
+	// container's network mode to be mapped to that of another existing container
+	networkModeContainerPrefix = "container:"
 )
 
 // TaskOverrides are the overrides applied to a task
 type TaskOverrides struct{}
-
-// TaskVolume is a definition of all the volumes available for containers to
-// reference within a task. It must be named.
-type TaskVolume struct {
-	Name   string `json:"name"`
-	Volume HostVolume
-}
 
 // Task is the internal representation of a task in the ECS agent
 type Task struct {
@@ -112,17 +115,22 @@ type Task struct {
 	// used to look up the credentials for task in the credentials manager
 	credentialsID     string
 	credentialsIDLock sync.RWMutex
+
+	// ENI is the elastic network interface specified by this task
+	ENI     *ENI
+	eniLock sync.RWMutex
 }
 
 // PostUnmarshalTask is run after a task has been unmarshalled, but before it has been
 // run. It is possible it will be subsequently called after that and should be
 // able to handle such an occurrence appropriately (e.g. behave idempotently).
-func (task *Task) PostUnmarshalTask(credentialsManager credentials.Manager) {
+func (task *Task) PostUnmarshalTask(cfg *config.Config, credentialsManager credentials.Manager) {
 	// TODO, add rudimentary plugin support and call any plugins that want to
 	// hook into this
 	task.adjustForPlatform()
 	task.initializeEmptyVolumes()
 	task.initializeCredentialsEndpoint(credentialsManager)
+	task.addNetworkResourceProvisioningDependency(cfg)
 }
 
 func (task *Task) initializeEmptyVolumes() {
@@ -134,10 +142,14 @@ func (task *Task) initializeEmptyVolumes() {
 				continue
 			}
 			if _, ok := vol.(*EmptyHostVolume); ok {
-				if container.RunDependencies == nil {
-					container.RunDependencies = make([]string, 0)
+				if container.TransitionDependencySet.ContainerDependencies == nil {
+					container.TransitionDependencySet.ContainerDependencies = make([]ContainerDependency, 0)
 				}
-				container.RunDependencies = append(container.RunDependencies, emptyHostVolumeName)
+				container.TransitionDependencySet.ContainerDependencies = append(container.TransitionDependencySet.ContainerDependencies, ContainerDependency{
+					ContainerName:   emptyHostVolumeName,
+					SatisfiedStatus: ContainerRunning,
+					DependentStatus: ContainerCreated,
+				})
 				requiredEmptyVolumes = append(requiredEmptyVolumes, mountPoint.SourceVolume)
 			}
 		}
@@ -164,12 +176,11 @@ func (task *Task) initializeEmptyVolumes() {
 			Command:             []string{emptyvolume.Command}, // Command required, but this only gets created so N/A
 			MountPoints:         mountPoints,
 			Essential:           false,
-			IsInternal:          true,
+			Type:                ContainerEmptyHostVolume,
 			DesiredStatusUnsafe: ContainerRunning,
 		}
 		task.Containers = append(task.Containers, sourceContainer)
 	}
-
 }
 
 // initializeCredentialsEndpoint sets the credentials endpoint for all containers in a task if needed.
@@ -213,6 +224,67 @@ func (task *Task) initializeCredentialsEndpoint(credentialsManager credentials.M
 		container.Environment[awsSDKCredentialsRelativeURIPathEnvironmentVariableName] = credentialsEndpointRelativeURI
 	}
 
+}
+
+// BuildCNIConfig constructs the cni configuration from eni
+func (task *Task) BuildCNIConfig() (*ecscni.Config, error) {
+	if !task.isNetworkModeVPC() {
+		return nil, errors.New("task config: task has no ENIs associated with it, unable to generate cni config")
+	}
+
+	cfg := &ecscni.Config{}
+	eni := task.GetTaskENI()
+
+	cfg.ENIID = eni.ID
+	cfg.ID = eni.MacAddress
+	cfg.ENIMACAddress = eni.MacAddress
+	for _, ipv4 := range eni.IPV4Addresses {
+		if ipv4.Primary {
+			cfg.ENIIPV4Address = ipv4.Address
+			break
+		}
+	}
+
+	// If there is ipv6 assigned to eni then set it
+	if len(eni.IPV6Addresses) > 0 {
+		cfg.ENIIPV6Address = eni.IPV6Addresses[0].Address
+	}
+
+	return cfg, nil
+}
+
+// isNetworkModeVPC checks if the task is configured to use task-networking feature
+func (task *Task) isNetworkModeVPC() bool {
+	if task.GetTaskENI() == nil {
+		return false
+	}
+
+	return true
+}
+
+func (task *Task) addNetworkResourceProvisioningDependency(cfg *config.Config) {
+	if !task.isNetworkModeVPC() {
+		return
+	}
+	for _, container := range task.Containers {
+		if container.IsInternal() {
+			continue
+		}
+		if container.TransitionDependencySet.ContainerDependencies == nil {
+			container.TransitionDependencySet.ContainerDependencies = make([]ContainerDependency, 0)
+		}
+		container.TransitionDependencySet.ContainerDependencies = append(container.TransitionDependencySet.ContainerDependencies, ContainerDependency{
+			ContainerName:   PauseContainerName,
+			SatisfiedStatus: ContainerResourcesProvisioned,
+			DependentStatus: ContainerPulled,
+		})
+	}
+	pauseContainer := NewContainerWithSteadyState(ContainerResourcesProvisioned)
+	pauseContainer.Name = PauseContainerName
+	pauseContainer.Image = fmt.Sprintf("%s:%s", cfg.PauseContainerImageName, cfg.PauseContainerTag)
+	pauseContainer.Essential = true
+	pauseContainer.Type = ContainerCNIPause
+	task.Containers = append(task.Containers, pauseContainer)
 }
 
 // ContainerByName returns the *Container for the given name
@@ -263,53 +335,75 @@ func (task *Task) UpdateMountPoints(cont *Container, vols map[string]string) {
 // there was no change
 // Invariant: task known status is the minimum of container known status
 func (task *Task) updateTaskKnownStatus() (newStatus TaskStatus) {
-	seelog.Debug("Updating task: %s", task.String())
-
+	seelog.Debugf("Updating task's known status, task: %s", task.String())
 	// Set to a large 'impossible' status that can't be the min
-	earliestStatus := ContainerZombie
+	containerEarliestKnownStatus := ContainerZombie
+	var earliestKnownStatusContainer *Container
 	essentialContainerStopped := false
 	for _, container := range task.Containers {
 		containerKnownStatus := container.GetKnownStatus()
 		if containerKnownStatus == ContainerStopped && container.Essential {
 			essentialContainerStopped = true
 		}
-		if containerKnownStatus < earliestStatus {
-			earliestStatus = containerKnownStatus
+		if containerKnownStatus < containerEarliestKnownStatus {
+			containerEarliestKnownStatus = containerKnownStatus
+			earliestKnownStatusContainer = container
 		}
 	}
-
-	// If the essential container is stopped while other containers may be running
-	// don't update the task status until the other containers are stopped.
-	if earliestStatus == ContainerRunning && essentialContainerStopped {
-		seelog.Debug("Essential container is stopped while other containers are running, not updating task status, task: %v", task)
+	if earliestKnownStatusContainer == nil {
+		seelog.Criticalf(
+			"Impossible state found while updating tasks's known status, earliest state recorded as %s for task [%v]",
+			containerEarliestKnownStatus.String(), task)
 		return TaskStatusNone
 	}
-	seelog.Debug("Earliest status is %q for task %v", earliestStatus.String(), task)
-	if task.GetKnownStatus() < earliestStatus.TaskStatus() {
-		task.SetKnownStatus(earliestStatus.TaskStatus())
+	seelog.Debugf("Container with earliest known container is [%s] for task: %s",
+		earliestKnownStatusContainer.String(), task.String())
+	// If the essential container is stopped while other containers may be running
+	// don't update the task status until the other containers are stopped.
+	if earliestKnownStatusContainer.IsKnownSteadyState() && essentialContainerStopped {
+		seelog.Debugf(
+			"Essential container is stopped while other containers are running, not updating task status for task: %s",
+			task.String())
+		return TaskStatusNone
+	}
+	// We can't rely on earliest container known status alone for determining if the
+	// task state needs to be updated as containers can have different steady states
+	// defined. Instead we should get the task status for all containers' known
+	// statuses and compute the min of this
+	earliestKnownTaskStatus := task.getEarliestKnownTaskStatusForContainers()
+	if task.GetKnownStatus() < earliestKnownTaskStatus {
+		seelog.Debugf("Updating task's known status to: %s, task: %s",
+			earliestKnownTaskStatus.String(), task.String())
+		task.SetKnownStatus(earliestKnownTaskStatus)
 		return task.GetKnownStatus()
 	}
 	return TaskStatusNone
 }
 
-// Overridden returns a copy of the task with all container's overridden and
-// itself overridden as well
-func (task *Task) Overridden() *Task {
-	result := *task
-	// Task has no overrides currently, just do the containers
-
-	// Shallow copy, take care of the deeper bits too
-	result.Containers = make([]*Container, len(result.Containers))
-	for i, cont := range task.Containers {
-		result.Containers[i] = cont.Overridden()
+// getEarliestKnownTaskStatusForContainers gets the lowest (earliest) task status
+// based on the known statuses of all containers in the task
+func (task *Task) getEarliestKnownTaskStatusForContainers() TaskStatus {
+	if len(task.Containers) == 0 {
+		seelog.Criticalf("No containers in the task: %s", task.String())
+		return TaskStatusNone
 	}
-	return &result
+	// Set earliest container status to an impossible to reach 'high' task status
+	earliest := TaskZombie
+	for _, container := range task.Containers {
+		containerKnownStatus := container.GetKnownStatus()
+		containerTaskStatus := containerKnownStatus.TaskStatus(container.GetSteadyStateStatus())
+		if containerTaskStatus < earliest {
+			earliest = containerTaskStatus
+		}
+	}
+
+	return earliest
 }
 
 // DockerConfig converts the given container in this task to the format of
 // GoDockerClient's 'Config' struct
 func (task *Task) DockerConfig(container *Container) (*docker.Config, *DockerClientConfigError) {
-	return task.Overridden().dockerConfig(container.Overridden())
+	return task.dockerConfig(container)
 }
 
 func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerClientConfigError) {
@@ -364,7 +458,9 @@ func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerCli
 // reason for 2 over 1 is that 1 is an invalid value (Linux's choice, not Docker's).
 func (task *Task) dockerCPUShares(containerCPU uint) int64 {
 	if containerCPU <= 1 {
-		log.Debug("Converting CPU shares to allowed minimum of 2", "task", task.Arn, "cpuShares", containerCPU)
+		seelog.Debugf(
+			"Converting CPU shares to allowed minimum of 2 for task arn: [%s] and cpu shares: %d",
+			task.Arn, containerCPU)
 		return 2
 	}
 	return int64(containerCPU)
@@ -390,7 +486,8 @@ func (task *Task) dockerConfigVolumes(container *Container) (map[string]struct{}
 		// you can handle most volume mount types in the HostConfig at run-time;
 		// empty mounts are created by docker at create-time (Config) so set
 		// them here.
-		if container.Name == emptyHostVolumeName && container.IsInternal {
+		if container.Type == ContainerEmptyHostVolume {
+			// if container.Name == emptyHostVolumeName && container.Type {
 			_, ok := vol.(*EmptyHostVolume)
 			if !ok {
 				return nil, &badVolumeError{"Empty volume container in task " + task.Arn + " was the wrong type"}
@@ -403,7 +500,7 @@ func (task *Task) dockerConfigVolumes(container *Container) (map[string]struct{}
 }
 
 func (task *Task) DockerHostConfig(container *Container, dockerContainerMap map[string]*DockerContainer) (*docker.HostConfig, *HostConfigError) {
-	return task.Overridden().dockerHostConfig(container.Overridden(), dockerContainerMap)
+	return task.dockerHostConfig(container, dockerContainerMap)
 }
 
 func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[string]*DockerContainer) (*docker.HostConfig, *HostConfigError) {
@@ -438,7 +535,84 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
 		}
 	}
 
+	task.platformHostConfigOverride(hostConfig)
+
+	// Determine if network mode should be overridden and override it if needed
+	ok, networkMode := task.shouldOverrideNetworkMode(container, dockerContainerMap)
+	if !ok {
+		return hostConfig, nil
+	}
+	hostConfig.NetworkMode = networkMode
+	// Override 'awsvpc' parameters if needed
+	if container.Type == ContainerCNIPause {
+		// Override the DNS settings for the pause container if ENI has custom
+		// DNS settings
+		return task.overrideDNS(hostConfig), nil
+	}
+
 	return hostConfig, nil
+}
+
+// shouldOverrideNetworkMode returns true if the network mode of the container needs
+// to be overridden. It also returns the override string in this case. It returns
+// false otherwise
+func (task *Task) shouldOverrideNetworkMode(container *Container, dockerContainerMap map[string]*DockerContainer) (bool, string) {
+	// TODO. We can do an early return here by determining which kind of task it is
+	// Example: Does this task have ENIs in its payload, what is its networking mode etc
+	if container.IsInternal() {
+		// If it's an internal container, set the network mode to none.
+		// Currently, internal containers are either for creating empty host
+		// volumes or for creating the 'pause' container. Both of these
+		// only need the network mode to be set to "none"
+		return true, networkModeNone
+	}
+
+	// For other types of containers, determine if the container map contains
+	// a pause container. Since a pause container is only added to the task
+	// when using non docker daemon supported network modes, its existence
+	// indicates the need to configure the network mode outside of supported
+	// network drivers
+	if task.GetTaskENI() == nil {
+		return false, ""
+	}
+
+	pauseContName := ""
+	for _, cont := range task.Containers {
+		if cont.Type == ContainerCNIPause {
+			pauseContName = cont.Name
+			break
+		}
+	}
+	if pauseContName == "" {
+		seelog.Critical("Pause container required, but not found in the task: %s", task.String())
+		return false, ""
+	}
+	pauseContainer, ok := dockerContainerMap[pauseContName]
+	if !ok || pauseContainer == nil {
+		// This should never be the case and implies a code-bug.
+		seelog.Criticalf("Pause container required, but not found in container map for container: [%s] in task: %s",
+			container.String(), task.String())
+		return false, ""
+	}
+	return true, networkModeContainerPrefix + pauseContainer.DockerID
+}
+
+// overrideDNS overrides a container's host config if the following conditions are
+// true:
+// 1. Task has an ENI associated with it
+// 2. ENI has custom DNS IPs and search list associated with it
+// This should only be done for the pause container as other containers inherit
+// /etc/resolv.conf of this container (they share the network namespace)
+func (task *Task) overrideDNS(hostConfig *docker.HostConfig) *docker.HostConfig {
+	eni := task.GetTaskENI()
+	if eni == nil {
+		return hostConfig
+	}
+
+	hostConfig.DNS = eni.DomainNameServers
+	hostConfig.DNSSearch = eni.DomainNameSearchList
+
+	return hostConfig
 }
 
 func (task *Task) dockerLinks(container *Container, dockerContainerMap map[string]*DockerContainer) ([]string, error) {
@@ -454,7 +628,8 @@ func (task *Task) dockerLinks(container *Container, dockerContainerMap map[strin
 		if len(linkParts) == 2 {
 			linkAlias = linkParts[1]
 		} else {
-			log.Warn("Warning, link with no linkalias", "linkName", linkName, "task", task, "container", container)
+			seelog.Warnf("Link name [%s] found with no linkalias for container: [%s] in task: [%s]",
+				linkName, container.String(), task.String())
 			linkAlias = linkName
 		}
 
@@ -474,9 +649,9 @@ func (task *Task) dockerPortMap(container *Container) map[docker.Port][]docker.P
 		dockerPort := docker.Port(strconv.Itoa(int(portBinding.ContainerPort)) + "/" + portBinding.Protocol.String())
 		currentMappings, existing := dockerPortMap[dockerPort]
 		if existing {
-			dockerPortMap[dockerPort] = append(currentMappings, docker.PortBinding{HostIP: portBindingHostIP, HostPort: strconv.Itoa(int(portBinding.HostPort))})
+			dockerPortMap[dockerPort] = append(currentMappings, docker.PortBinding{HostPort: strconv.Itoa(int(portBinding.HostPort))})
 		} else {
-			dockerPortMap[dockerPort] = []docker.PortBinding{{HostIP: portBindingHostIP, HostPort: strconv.Itoa(int(portBinding.HostPort))}}
+			dockerPortMap[dockerPort] = []docker.PortBinding{{HostPort: strconv.Itoa(int(portBinding.HostPort))}}
 		}
 	}
 	return dockerPortMap
@@ -513,7 +688,9 @@ func (task *Task) dockerHostBinds(container *Container) ([]string, error) {
 		}
 
 		if hv.SourcePath() == "" || mountPoint.ContainerPath == "" {
-			log.Error("Unable to resolve volume mounts; invalid path: " + container.Name + " " + mountPoint.SourceVolume + "; " + hv.SourcePath() + " -> " + mountPoint.ContainerPath)
+			seelog.Errorf(
+				"Unable to resolve volume mounts for container [%s]; invalid path: [%s]; [%s] -> [%s] in task: [%s]",
+				container.Name, mountPoint.SourceVolume, hv.SourcePath(), mountPoint.ContainerPath, task.String())
 			return []string{}, errors.New("Unable to resolve volume mounts; invalid path: " + container.Name + " " + mountPoint.SourceVolume + "; " + hv.SourcePath() + " -> " + mountPoint.ContainerPath)
 		}
 
@@ -546,6 +723,13 @@ func TaskFromACS(acsTask *ecsacs.Task, envelope *ecsacs.PayloadMessage) (*Task, 
 		task.StopSequenceNumber = *envelope.SeqNum
 	}
 
+	// Overrides the container command if it's set
+	for _, container := range task.Containers {
+		if (container.Overrides != ContainerOverrides{}) && container.Overrides.Command != nil {
+			container.Command = *container.Overrides.Command
+		}
+	}
+
 	return task, nil
 }
 
@@ -568,14 +752,14 @@ func (task *Task) UpdateDesiredStatus() {
 // updateTaskDesiredStatus determines what status the task should properly be at based on the containers' statuses
 // Invariant: task desired status must be stopped if any essential container is stopped
 func (task *Task) updateTaskDesiredStatus() {
-	llog := log.New("task", task)
-	llog.Debug("Updating task")
+	seelog.Debugf("Updating task: [%s]", task.String())
 
 	// A task's desired status is stopped if any essential container is stopped
 	// Otherwise, the task's desired status is unchanged (typically running, but no need to change)
 	for _, cont := range task.Containers {
 		if cont.Essential && (cont.KnownTerminal() || cont.DesiredTerminal()) {
-			llog.Debug("Updating task desired status to stopped", "container", cont.Name)
+			seelog.Debugf("Updating task desired status to stopped because of container: [%s]; task: [%s]",
+				cont.Name, task.String())
 			task.SetDesiredStatus(TaskStopped)
 		}
 	}
@@ -584,11 +768,13 @@ func (task *Task) updateTaskDesiredStatus() {
 // updateContainerDesiredStatus sets all container's desired status's to the
 // task's desired status
 // Invariant: container desired status is <= task desired status converted to container status
+// Note: task desired status and container desired status is typically only RUNNING or STOPPED
 func (task *Task) updateContainerDesiredStatus() {
 	for _, c := range task.Containers {
 		taskDesiredStatus := task.GetDesiredStatus()
-		if c.GetDesiredStatus() < taskDesiredStatus.ContainerStatus() {
-			c.SetDesiredStatus(taskDesiredStatus.ContainerStatus())
+		taskDesiredStatusToContainerStatus := taskDesiredStatus.ContainerStatus(c.GetSteadyStateStatus())
+		if c.GetDesiredStatus() < taskDesiredStatusToContainerStatus {
+			c.SetDesiredStatus(taskDesiredStatusToContainerStatus)
 		}
 	}
 }
@@ -677,12 +863,35 @@ func (task *Task) SetSentStatus(status TaskStatus) {
 	task.SentStatusUnsafe = status
 }
 
+// SetTaskENI sets the eni information of the task
+func (task *Task) SetTaskENI(eni *ENI) {
+	task.eniLock.Lock()
+	defer task.eniLock.Unlock()
+
+	task.ENI = eni
+}
+
+// GetTaskENI returns the eni of task, for now task can only have one enis
+func (task *Task) GetTaskENI() *ENI {
+	task.eniLock.RLock()
+	defer task.eniLock.RUnlock()
+
+	return task.ENI
+}
+
 // String returns a human readable string representation of this object
-func (t *Task) String() string {
-	res := fmt.Sprintf("%s:%s %s, Status: (%s->%s)", t.Family, t.Version, t.Arn, t.GetKnownStatus().String(), t.GetDesiredStatus().String())
+func (task *Task) String() string {
+	res := fmt.Sprintf("%s:%s %s, TaskStatus: (%s->%s)",
+		task.Family, task.Version, task.Arn,
+		task.GetKnownStatus().String(), task.GetDesiredStatus().String())
 	res += " Containers: ["
-	for _, c := range t.Containers {
+	for _, c := range task.Containers {
 		res += fmt.Sprintf("%s (%s->%s),", c.Name, c.GetKnownStatus().String(), c.GetDesiredStatus().String())
+	}
+	task.eniLock.Lock()
+	defer task.eniLock.Unlock()
+	if task.ENI != nil {
+		res += fmt.Sprintf(" ENI: [%s]", task.ENI.String())
 	}
 	return res + "]"
 }

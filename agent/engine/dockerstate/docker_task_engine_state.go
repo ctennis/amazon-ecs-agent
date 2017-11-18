@@ -21,6 +21,7 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/engine/image"
 	"github.com/aws/amazon-ecs-agent/agent/logger"
+	"github.com/cihub/seelog"
 )
 
 var log = logger.ForModule("dockerstate")
@@ -50,6 +51,12 @@ type TaskEngineState interface {
 	AddContainer(container *api.DockerContainer, task *api.Task)
 	// AddImageState adds an image.ImageState to be stored
 	AddImageState(imageState *image.ImageState)
+	// AddENIAttachment adds an eni attachment from acs to be stored
+	AddENIAttachment(eni *api.ENIAttachment)
+	// RemoveENIAttachment removes an eni attachment to stop tracking
+	RemoveENIAttachment(mac string)
+	// ENIByMac returns the specific ENIAttachment of the given mac address
+	ENIByMac(mac string) (*api.ENIAttachment, bool)
 	// RemoveTask removes a task from the state
 	RemoveTask(task *api.Task)
 	// Reset resets all the fileds in the state
@@ -76,11 +83,12 @@ type TaskEngineState interface {
 type DockerTaskEngineState struct {
 	lock sync.RWMutex
 
-	tasks         map[string]*api.Task                       // taskarn -> api.Task
-	idToTask      map[string]string                          // DockerId -> taskarn
-	taskToID      map[string]map[string]*api.DockerContainer // taskarn -> (containername -> api.DockerContainer)
-	idToContainer map[string]*api.DockerContainer            // DockerId -> api.DockerContainer
-	imageStates   map[string]*image.ImageState
+	tasks          map[string]*api.Task                       // taskarn -> api.Task
+	idToTask       map[string]string                          // DockerId -> taskarn
+	taskToID       map[string]map[string]*api.DockerContainer // taskarn -> (containername -> api.DockerContainer)
+	idToContainer  map[string]*api.DockerContainer            // DockerId -> api.DockerContainer
+	eniAttachments map[string]*api.ENIAttachment              // ENIMac -> api.ENIAttachment
+	imageStates    map[string]*image.ImageState
 }
 
 // NewTaskEngineState returns a new TaskEngineState
@@ -103,6 +111,7 @@ func (state *DockerTaskEngineState) initializeDockerTaskEngineState() {
 	state.taskToID = make(map[string]map[string]*api.DockerContainer)
 	state.idToContainer = make(map[string]*api.DockerContainer)
 	state.imageStates = make(map[string]*image.ImageState)
+	state.eniAttachments = make(map[string]*api.ENIAttachment)
 }
 
 // Reset resets all the states
@@ -142,6 +151,66 @@ func (state *DockerTaskEngineState) allImageStates() []*image.ImageState {
 		allImageStates = append(allImageStates, imageState)
 	}
 	return allImageStates
+}
+
+// AllENIAttachments returns all the enis managed by ecs on the instance
+func (state *DockerTaskEngineState) AllENIAttachments() []*api.ENIAttachment {
+	state.lock.RLock()
+	defer state.lock.RUnlock()
+
+	return state.allENIAttachmentsUnsafe()
+}
+
+func (state *DockerTaskEngineState) allENIAttachmentsUnsafe() []*api.ENIAttachment {
+	var allENIAttachments []*api.ENIAttachment
+	for _, v := range state.eniAttachments {
+		allENIAttachments = append(allENIAttachments, v)
+	}
+
+	return allENIAttachments
+}
+
+// ENIByMac returns the eni object that match the give mac address
+func (state *DockerTaskEngineState) ENIByMac(mac string) (*api.ENIAttachment, bool) {
+	state.lock.RLock()
+	defer state.lock.RUnlock()
+
+	eni, ok := state.eniAttachments[mac]
+	return eni, ok
+}
+
+// AddENIAttachment adds the eni into the state
+func (state *DockerTaskEngineState) AddENIAttachment(eniAttachment *api.ENIAttachment) {
+	if eniAttachment == nil {
+		log.Debug("Cannot add empty eni attachment information")
+		return
+	}
+
+	state.lock.Lock()
+	defer state.lock.Unlock()
+
+	if _, ok := state.eniAttachments[eniAttachment.MACAddress]; !ok {
+		state.eniAttachments[eniAttachment.MACAddress] = eniAttachment
+	} else {
+		seelog.Debugf("Duplicate eni attachment information: %v", eniAttachment)
+	}
+
+}
+
+// RemoveENIAttachment removes the eni from state and stop managing
+func (state *DockerTaskEngineState) RemoveENIAttachment(mac string) {
+	if mac == "" {
+		log.Debug("Cannot remove empty eni attachment information")
+		return
+	}
+	state.lock.Lock()
+	defer state.lock.Unlock()
+
+	if _, ok := state.eniAttachments[mac]; ok {
+		delete(state.eniAttachments, mac)
+	} else {
+		seelog.Debugf("Delete non-existed eni attachment: %v", mac)
+	}
 }
 
 // GetAllContainerIDs returns all of the Container Ids
@@ -249,19 +318,14 @@ func (state *DockerTaskEngineState) AddContainer(container *api.DockerContainer,
 		state.tasks[task.Arn] = task
 	}
 
-	if container.DockerID != "" {
-		state.idToTask[container.DockerID] = task.Arn
-	}
+	state.storeIDToContainerTaskUnsafe(container, task)
+
 	existingMap, exists := state.taskToID[task.Arn]
 	if !exists {
 		existingMap = make(map[string]*api.DockerContainer, len(task.Containers))
 		state.taskToID[task.Arn] = existingMap
 	}
 	existingMap[container.Container.Name] = container
-
-	if container.DockerID != "" {
-		state.idToContainer[container.DockerID] = container
-	}
 }
 
 // AddImageState adds an image.ImageState to be stored
@@ -288,19 +352,54 @@ func (state *DockerTaskEngineState) RemoveTask(task *api.Task) {
 
 	task, ok := state.tasks[task.Arn]
 	if !ok {
+		seelog.Warnf("Failed to locate task %s for removal from state", task.Arn)
 		return
 	}
 	delete(state.tasks, task.Arn)
+
 	containerMap, ok := state.taskToID[task.Arn]
 	if !ok {
+		seelog.Warnf("Failed to locate containerMap for task %s for removal from state", task.Arn)
 		return
 	}
 	delete(state.taskToID, task.Arn)
 
 	for _, dockerContainer := range containerMap {
-		delete(state.idToTask, dockerContainer.DockerID)
-		delete(state.idToContainer, dockerContainer.DockerID)
+		state.removeIDToContainerTaskUnsafe(dockerContainer)
 	}
+}
+
+// storeIDToContainerTaskUnsafe stores the container in the idToContainer and idToTask maps.  The key to the maps is
+// either the Docker-generated ID or the agent-generated name (if the ID is not available).  If the container is updated
+// with an ID, a subsequent call to this function will update the map to use the ID as the key.
+func (state *DockerTaskEngineState) storeIDToContainerTaskUnsafe(container *api.DockerContainer, task *api.Task) {
+	if container.DockerID != "" {
+		// Update the container id to the state
+		state.idToContainer[container.DockerID] = container
+		state.idToTask[container.DockerID] = task.Arn
+
+		// Remove the previously added name mapping
+		delete(state.idToContainer, container.DockerName)
+		delete(state.idToTask, container.DockerName)
+	} else if container.DockerName != "" {
+		// Update the container name mapping to the state when the ID isn't available
+		state.idToContainer[container.DockerName] = container
+		state.idToTask[container.DockerName] = task.Arn
+	}
+}
+
+// removeIDToContainerTaskUnsafe removes the container from the idToContainer and idToTask maps.  They key to the maps
+// is either the Docker-generated ID or the agent-generated name (if the ID is not available).  This function assumes
+// that the ID takes precedence and will delete by the ID when the ID is available.
+func (state *DockerTaskEngineState) removeIDToContainerTaskUnsafe(container *api.DockerContainer) {
+	// The key to these maps is either the Docker ID or agent-generated name.  We use the agent-generated name
+	// before a Docker ID is available.
+	key := container.DockerID
+	if key == "" {
+		key = container.DockerName
+	}
+	delete(state.idToTask, key)
+	delete(state.idToContainer, key)
 }
 
 // RemoveImageState removes an image.ImageState

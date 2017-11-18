@@ -33,7 +33,8 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-const sampleCredentialsMessage = `
+const (
+	sampleCredentialsMessage = `
 {
   "type": "IAMRoleCredentialsMessage",
   "message": {
@@ -51,10 +52,34 @@ const sampleCredentialsMessage = `
   }
 }
 `
+	sampleAttachENIMessage = `
+{
+  "type": "AttachTaskNetworkInterfacesMessage",
+  "message": {
+    "messageId": "123",
+    "clusterArn": "default",
+    "taskArn": "task",
+    "elasticNetworkInterfaces":[{
+      "attachmentArn": "attach_arn",
+      "ec2Id": "eni_id",
+      "ipv4Addresses":[{
+        "primary": true,
+        "privateAddress": "ipv4"
+      }],
+      "ipv6Addresses":[{
+        "address": "ipv6"
+      }],
+      "macAddress": "mac"
+    }]
+  }
+}
+`
+)
 
 const (
 	TestClusterArn  = "arn:aws:ec2:123:container/cluster:123456"
 	TestInstanceArn = "arn:aws:ec2:123:container/containerInstance/12345678"
+	rwTimeout       = time.Second
 )
 
 var testCfg = &config.Config{
@@ -67,6 +92,7 @@ func TestMakeUnrecognizedRequest(t *testing.T) {
 	defer ctrl.Finish()
 
 	conn := mock_wsclient.NewMockWebsocketConn(ctrl)
+	conn.EXPECT().SetWriteDeadline(gomock.Any()).Return(nil)
 	conn.EXPECT().Close()
 
 	cs := testCS(conn)
@@ -83,6 +109,7 @@ func TestWriteAckRequest(t *testing.T) {
 	defer ctrl.Finish()
 
 	conn := mock_wsclient.NewMockWebsocketConn(ctrl)
+	conn.EXPECT().SetWriteDeadline(gomock.Any()).Return(nil).Times(2)
 	conn.EXPECT().Close()
 	cs := testCS(conn)
 	defer cs.Close()
@@ -109,7 +136,13 @@ func TestPayloadHandlerCalled(t *testing.T) {
 	defer ctrl.Finish()
 
 	conn := mock_wsclient.NewMockWebsocketConn(ctrl)
-	conn.EXPECT().ReadMessage().AnyTimes().Return(websocket.TextMessage, []byte(`{"type":"PayloadMessage","message":{"tasks":[{"arn":"arn"}]}}`), nil)
+	// Messages should be read from the connection at least once
+	conn.EXPECT().SetReadDeadline(gomock.Any()).Return(nil).MinTimes(1)
+	conn.EXPECT().ReadMessage().Return(websocket.TextMessage,
+		[]byte(`{"type":"PayloadMessage","message":{"tasks":[{"arn":"arn"}]}}`),
+		nil).MinTimes(1)
+	// Invoked when closing the connection
+	conn.EXPECT().SetWriteDeadline(gomock.Any()).Return(nil)
 	conn.EXPECT().Close()
 	cs := testCS(conn)
 	defer cs.Close()
@@ -134,9 +167,13 @@ func TestRefreshCredentialsHandlerCalled(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-
 	conn := mock_wsclient.NewMockWebsocketConn(ctrl)
-	conn.EXPECT().ReadMessage().AnyTimes().Return(websocket.TextMessage, []byte(sampleCredentialsMessage), nil)
+	// Messages should be read from the connection at least once
+	conn.EXPECT().SetReadDeadline(gomock.Any()).Return(nil).MinTimes(1)
+	conn.EXPECT().ReadMessage().Return(websocket.TextMessage,
+		[]byte(sampleCredentialsMessage), nil).MinTimes(1)
+	// Invoked when closing the connection
+	conn.EXPECT().SetWriteDeadline(gomock.Any()).Return(nil)
 	conn.EXPECT().Close()
 	cs := testCS(conn)
 	defer cs.Close()
@@ -170,9 +207,15 @@ func TestClosingConnection(t *testing.T) {
 
 	// Returning EOF tells the ClientServer that the connection is closed
 	conn := mock_wsclient.NewMockWebsocketConn(ctrl)
+	conn.EXPECT().SetReadDeadline(gomock.Any()).Return(nil)
 	conn.EXPECT().ReadMessage().Return(0, nil, io.EOF)
+	// SetWriteDeadline will be invoked once for WriteMessage() and
+	// once for Close()
+	conn.EXPECT().SetWriteDeadline(gomock.Any()).Return(nil).Times(2)
 	conn.EXPECT().WriteMessage(gomock.Any(), gomock.Any()).Return(io.EOF)
+	conn.EXPECT().Close()
 	cs := testCS(conn)
+	defer cs.Close()
 
 	serveErr := cs.Serve()
 	assert.Error(t, serveErr)
@@ -192,7 +235,7 @@ func TestConnect(t *testing.T) {
 		t.Fatal(<-serverErr)
 	}()
 
-	cs := New(server.URL, testCfg, credentials.AnonymousCredentials)
+	cs := New(server.URL, testCfg, credentials.AnonymousCredentials, rwTimeout)
 	// Wait for up to a second for the mock server to launch
 	for i := 0; i < 100; i++ {
 		err = cs.Connect()
@@ -263,7 +306,7 @@ func TestConnectClientError(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	cs := New(testServer.URL, testCfg, credentials.AnonymousCredentials)
+	cs := New(testServer.URL, testCfg, credentials.AnonymousCredentials, rwTimeout)
 	err := cs.Connect()
 	_, ok := err.(*wsclient.WSError)
 	assert.True(t, ok)
@@ -272,7 +315,8 @@ func TestConnectClientError(t *testing.T) {
 
 func testCS(conn *mock_wsclient.MockWebsocketConn) wsclient.ClientServer {
 	testCreds := credentials.AnonymousCredentials
-	cs := New("localhost:443", testCfg, testCreds).(*clientServer)
+	foo := New("localhost:443", testCfg, testCreds, rwTimeout)
+	cs := foo.(*clientServer)
 	cs.SetConnection(conn)
 	return cs
 }
@@ -311,4 +355,55 @@ func startMockAcsServer(t *testing.T, closeWS <-chan bool) (*httptest.Server, ch
 
 	server := httptest.NewTLSServer(handler)
 	return server, serverChan, requestsChan, errChan, nil
+}
+
+func TestAttachENIHandlerCalled(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	conn := mock_wsclient.NewMockWebsocketConn(ctrl)
+	cs := testCS(conn)
+	defer cs.Close()
+
+	// Messages should be read from the connection at least once
+	conn.EXPECT().SetReadDeadline(gomock.Any()).Return(nil).MinTimes(1)
+	conn.EXPECT().ReadMessage().Return(websocket.TextMessage,
+		[]byte(sampleAttachENIMessage), nil).MinTimes(1)
+	// Invoked when closing the connection
+	conn.EXPECT().SetWriteDeadline(gomock.Any()).Return(nil)
+	conn.EXPECT().Close()
+
+	messageChannel := make(chan *ecsacs.AttachTaskNetworkInterfacesMessage)
+	reqHandler := func(message *ecsacs.AttachTaskNetworkInterfacesMessage) {
+		messageChannel <- message
+	}
+
+	cs.AddRequestHandler(reqHandler)
+
+	go cs.Serve()
+
+	expectedMessage := &ecsacs.AttachTaskNetworkInterfacesMessage{
+		MessageId:  aws.String("123"),
+		ClusterArn: aws.String("default"),
+		TaskArn:    aws.String("task"),
+		ElasticNetworkInterfaces: []*ecsacs.ElasticNetworkInterface{
+			{AttachmentArn: aws.String("attach_arn"),
+				Ec2Id: aws.String("eni_id"),
+				Ipv4Addresses: []*ecsacs.IPv4AddressAssignment{
+					{
+						Primary:        aws.Bool(true),
+						PrivateAddress: aws.String("ipv4"),
+					},
+				},
+				Ipv6Addresses: []*ecsacs.IPv6AddressAssignment{
+					{
+						Address: aws.String("ipv6"),
+					},
+				},
+				MacAddress: aws.String("mac"),
+			},
+		},
+	}
+
+	assert.Equal(t, <-messageChannel, expectedMessage)
 }
