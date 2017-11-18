@@ -12,6 +12,7 @@ node {
   stage("Build") {
     sh """
 echo ${image_tag} > VERSION
+mkdir out
 make
 docker tag ${image}:make ${repo}/${image}:${image_tag}
 """
