@@ -125,3 +125,46 @@ func TestIsInternal(t *testing.T) {
 			})
 	}
 }
+
+// TestSetupExecutionRoleFlag tests whether or not the container appropriately
+//sets the flag for using execution roles
+func TestSetupExecutionRoleFlag(t *testing.T) {
+	testCases := []struct {
+		container *Container
+		result    bool
+		msg       string
+	}{
+		{&Container{}, false, "the container does not use ECR, so it should not require credentials"},
+		{
+			&Container{
+				RegistryAuthentication: &RegistryAuthenticationData{Type: "non-ecr"},
+			},
+			false,
+			"the container does not use ECR, so it should not require credentials",
+		},
+		{
+			&Container{
+				RegistryAuthentication: &RegistryAuthenticationData{Type: "ecr"},
+			},
+			false, "the container uses ECR, but it does not require execution role credentials",
+		},
+		{
+			&Container{
+				RegistryAuthentication: &RegistryAuthenticationData{
+					Type: "ecr",
+					ECRAuthData: &ECRAuthData{
+						UseExecutionRole: true,
+					},
+				},
+			},
+			true,
+			"the container uses ECR and require execution role credentials",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(fmt.Sprintf("Container: %s", testCase.container.String()), func(t *testing.T) {
+			assert.Equal(t, testCase.result, testCase.container.ShouldPullWithExecutionRole(), testCase.msg)
+		})
+	}
+}

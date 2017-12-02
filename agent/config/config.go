@@ -314,6 +314,20 @@ func environmentConfig() (Config, error) {
 	taskENIEnabled := utils.ParseBool(os.Getenv("ECS_ENABLE_TASK_ENI"), false)
 	taskIAMRoleEnabled := utils.ParseBool(os.Getenv("ECS_ENABLE_TASK_IAM_ROLE"), false)
 	taskIAMRoleEnabledForNetworkHost := utils.ParseBool(os.Getenv("ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST"), false)
+	overrideAWSLogsExecutionRoleEnabled := utils.ParseBool(os.Getenv("ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE"), false)
+
+	var taskCPUMemLimitEnabled Conditional
+	taskCPUMemLimitConfigString := os.Getenv("ECS_ENABLE_TASK_CPU_MEM_LIMIT")
+
+	// We only want to set taskCPUMemLimit if it is explicitly set to true or false.
+	// We can do this by checking against the ParseBool default
+	if taskCPUMemLimitConfigString != "" {
+		if utils.ParseBool(taskCPUMemLimitConfigString, false) {
+			taskCPUMemLimitEnabled = ExplicitlyEnabled
+		} else {
+			taskCPUMemLimitEnabled = ExplicitlyDisabled
+		}
+	}
 
 	credentialsAuditLogFile := os.Getenv("ECS_AUDIT_LOGFILE")
 	credentialsAuditLogDisabled := utils.ParseBool(os.Getenv("ECS_AUDIT_LOGFILE_DISABLED"), false)
@@ -383,6 +397,7 @@ func environmentConfig() (Config, error) {
 		TaskCleanupWaitDuration:          taskCleanupWaitDuration,
 		TaskENIEnabled:                   taskENIEnabled,
 		TaskIAMRoleEnabled:               taskIAMRoleEnabled,
+		TaskCPUMemLimit:                  taskCPUMemLimitEnabled,
 		DockerStopTimeout:                dockerStopTimeout,
 		CredentialsAuditLogFile:          credentialsAuditLogFile,
 		CredentialsAuditLogDisabled:      credentialsAuditLogDisabled,
@@ -397,6 +412,7 @@ func environmentConfig() (Config, error) {
 		AWSVPCAdditionalLocalRoutes:      additionalLocalRoutes,
 		ContainerMetadataEnabled:         containerMetadataEnabled,
 		DataDirOnHost:                    dataDirOnHost,
+		OverrideAWSLogsExecutionRole:     overrideAWSLogsExecutionRoleEnabled,
 	}, err
 }
 
@@ -541,7 +557,8 @@ func (cfg *Config) String() string {
 			"DisableMetrics: %v, "+
 			"ReservedMem: %v, "+
 			"TaskCleanupWaitDuration: %v, "+
-			"DockerStopTimeout: %v"+
+			"DockerStopTimeout: %v, "+
+			"TaskCPUMemLimit: %v, "+
 			"%s",
 		cfg.Cluster,
 		cfg.AWSRegion,
@@ -553,6 +570,7 @@ func (cfg *Config) String() string {
 		cfg.ReservedMemory,
 		cfg.TaskCleanupWaitDuration,
 		cfg.DockerStopTimeout,
+		cfg.TaskCPUMemLimit,
 		cfg.platformString(),
 	)
 }

@@ -1,5 +1,14 @@
 #Changelog
 
+## 1.16.0
+* Feature - Support pulling from Amazon ECR with specified IAM role in task definition
+* Feature - Enable support for task level CPU and memory constraints.
+* Feature - Enable the ECS agent to run as a Windows service. [#1070](https://github.com/aws/amazon-ecs-agent/pull/1070)
+* Enhancement - Support CloudWatch metrics for Windows. [#1077](https://github.com/aws/amazon-ecs-agent/pull/1077)
+* Enhancement - Enforce memory limits on Windows. [#1069](https://github.com/aws/amazon-ecs-agent/pull/1069)
+* Enhancement - Enforce CPU limits on Windows. [#1089](https://github.com/aws/amazon-ecs-agent/pull/1089)
+* Enhancement - Simplify task IAM credential host setup. [#1105](https://github.com/aws/amazon-ecs-agent/pull/1105)
+
 ## 1.15.2
 * Bug - Fixed a bug where container state information wasn't reported. [#1076](https://github.com/aws/amazon-ecs-agent/pull/1076)
 
@@ -7,6 +16,7 @@
 * Bug - Fixed a bug where container state information wasn't reported. [#1067](https://github.com/aws/amazon-ecs-agent/pull/1067)
 * Bug - Fixed a bug where a task can be blocked in creating state. [#1048](https://github.com/aws/amazon-ecs-agent/pull/1048)
 * Bug - Fixed dynamic HostPort in container metadata. [#1052](https://github.com/aws/amazon-ecs-agent/pull/1052)
+* Bug - Fixed bug on Windows where container memory limits are not enforced. [#1069](https://github.com/aws/amazon-ecs-agent/pull/1069)
 
 ## 1.15.0
 * Feature - Support for provisioning tasks with ENIs.
@@ -20,7 +30,7 @@
 * Bug - Fixed a bug where unsupported Docker API client versions could be registered.
   [#1014](https://github.com/aws/amazon-ecs-agent/pull/1014)
 * Bug - Fixed a bug where non-essential container state changes were sometimes not submitted.
-  [#1026](https://github.com/aws/amazon-ecs-agent/pull/1026) 
+  [#1026](https://github.com/aws/amazon-ecs-agent/pull/1026)
 
 ## 1.14.5
 * Enhancement - Retry failed container image pull operations [#975](https://github.com/aws/amazon-ecs-agent/pull/975)

@@ -23,6 +23,9 @@ import (
 )
 
 const (
+	// AgentCredentialsAddress is used to serve the credentials for tasks.
+	AgentCredentialsAddress = "127.0.0.1"
+	// defaultAuditLogFile specifies the default audit log filename
 	defaultCredentialsAuditLogFile = `log\audit.log`
 	// When using IAM roles for tasks on Windows, the credential proxy consumes port 80
 	httpPort = 80
@@ -63,9 +66,7 @@ func DefaultConfig() Config {
 		DataDir:          dataDir,
 		// DataDirOnHost is identical to DataDir for Windows because we do not
 		// run as a container
-		DataDirOnHost: dataDir,
-		// DisableMetrics is set to true on Windows as docker stats does not work
-		DisableMetrics:              true,
+		DataDirOnHost:               dataDir,
 		ReservedMemory:              0,
 		AvailableLoggingDrivers:     []dockerclient.LoggingDriver{dockerclient.JSONFileDriver, dockerclient.NoneDriver},
 		TaskCleanupWaitDuration:     DefaultTaskCleanupWaitDuration,
@@ -77,6 +78,7 @@ func DefaultConfig() Config {
 		ImageCleanupInterval:        DefaultImageCleanupTimeInterval,
 		NumImagesToDeletePerCycle:   DefaultNumImagesToDeletePerCycle,
 		ContainerMetadataEnabled:    false,
+		TaskCPUMemLimit:             ExplicitlyDisabled,
 	}
 }
 
@@ -89,6 +91,9 @@ func (cfg *Config) platformOverrides() {
 		}
 		cfg.ReservedPorts = append(cfg.ReservedPorts, httpPort)
 	}
+
+	// ensure TaskResourceLimit is disabled
+	cfg.TaskCPUMemLimit = ExplicitlyDisabled
 }
 
 // platformString returns platform-specific config data that can be serialized

@@ -38,6 +38,7 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/handlers"
 	credentialshandler "github.com/aws/amazon-ecs-agent/agent/handlers/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/resources"
 	"github.com/aws/amazon-ecs-agent/agent/sighandlers"
 	"github.com/aws/amazon-ecs-agent/agent/sighandlers/exitcodes"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
@@ -45,6 +46,7 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	"github.com/aws/amazon-ecs-agent/agent/version"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	aws_credentials "github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/cihub/seelog"
@@ -74,8 +76,12 @@ type agent interface {
 	// printECSAttributes prints the Agent's capabilities based on
 	// its environment
 	printECSAttributes() int
+	// startWindowsService starts the agent as a Windows Service
+	startWindowsService() int
 	// start starts the Agent execution
 	start() int
+	// setTerminationHandler sets the termination handler
+	setTerminationHandler(sighandlers.TerminationHandler)
 }
 
 // ecsAgent wraps all the entities needed to start the ECS Agent execution.
@@ -97,9 +103,11 @@ type ecsAgent struct {
 	subnet                string
 	mac                   string
 	metadataManager       containermetadata.Manager
+	resource              resources.Resource
+	terminationHandler    sighandlers.TerminationHandler
 }
 
-// newAgent returns a new ecsAgent object
+// newAgent returns a new ecsAgent object, but does not start anything
 func newAgent(
 	ctx context.Context,
 	blackholeEC2Metadata bool,
@@ -155,8 +163,10 @@ func newAgent(
 			PluginsPath:            cfg.CNIPluginsPath,
 			MinSupportedCNIVersion: config.DefaultMinSupportedCNIVersion,
 		}),
-		os:              oswrapper.New(),
-		metadataManager: metadataManager,
+		os:                 oswrapper.New(),
+		metadataManager:    metadataManager,
+		resource:           resources.New(),
+		terminationHandler: sighandlers.StartDefaultTerminationHandler,
 	}, nil
 }
 
@@ -169,10 +179,19 @@ func (agent *ecsAgent) printVersion() int {
 // printECSAttributes prints the Agent's ECS Attributes based on its
 // environment
 func (agent *ecsAgent) printECSAttributes() int {
-	for _, attr := range agent.capabilities() {
+	capabilities, err := agent.capabilities()
+	if err != nil {
+		seelog.Warnf("Unable to obtain capabilit: %v", err)
+		return exitcodes.ExitError
+	}
+	for _, attr := range capabilities {
 		fmt.Printf("%s\t%s\n", aws.StringValue(attr.Name), aws.StringValue(attr.Value))
 	}
 	return exitcodes.ExitSuccess
+}
+
+func (agent *ecsAgent) setTerminationHandler(handler sighandlers.TerminationHandler) {
+	agent.terminationHandler = handler
 }
 
 // start starts the ECS Agent
@@ -212,6 +231,21 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 		return exitcodes.ExitTerminal
 	}
 
+	// Conditionally create '/ecs' cgroup root
+	if agent.cfg.TaskCPUMemLimit.Enabled() {
+		err = agent.resource.Init()
+		// When task CPU and memory limits are enabled, all tasks are placed
+		// under the '/ecs' cgroup root.
+		if err != nil {
+			if agent.cfg.TaskCPUMemLimit == config.ExplicitlyEnabled {
+				seelog.Criticalf("Unable to setup '/ecs' cgroup: %v", err)
+				return exitcodes.ExitTerminal
+			}
+			seelog.Warnf("Disabling TaskCPUMemLimit because agent is unabled to setup '/ecs' cgroup: %v", err)
+			agent.cfg.TaskCPUMemLimit = config.ExplicitlyDisabled
+		}
+	}
+
 	var vpcSubnetAttributes []*ecs.Attribute
 	// Check if Task ENI is enabled
 	if agent.cfg.TaskENIEnabled {
@@ -242,7 +276,7 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 	// Register the container instance
 	err = agent.registerContainerInstance(stateManager, client, vpcSubnetAttributes)
 	if err != nil {
-		if isTranisent(err) {
+		if isTransient(err) {
 			return exitcodes.ExitError
 		}
 		return exitcodes.ExitTerminal
@@ -290,18 +324,24 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 	previousTaskEngine := engine.NewTaskEngine(agent.cfg, agent.dockerClient,
 		credentialsManager, containerChangeEventStream, imageManager, state, agent.metadataManager)
 
-	// previousState is used to verify that our current runtime configuration is
+	// previousStateManager is used to verify that our current runtime configuration is
 	// compatible with our past configuration as reflected by our state-file
-	previousState, err := agent.newStateManager(previousTaskEngine, &previousCluster,
+	previousStateManager, err := agent.newStateManager(previousTaskEngine, &previousCluster,
 		&previousContainerInstanceArn, &previousEC2InstanceID)
 	if err != nil {
 		seelog.Criticalf("Error creating state manager: %v", err)
 		return nil, "", err
 	}
 
-	err = previousState.Load()
+	err = previousStateManager.Load()
 	if err != nil {
 		seelog.Criticalf("Error loading previously saved state: %v", err)
+		return nil, "", err
+	}
+
+	err = agent.checkCompatibility(previousTaskEngine)
+	if err != nil {
+		seelog.Criticalf("Error checking compatibility with previously saved state: %v", err)
 		return nil, "", err
 	}
 
@@ -412,7 +452,12 @@ func (agent *ecsAgent) registerContainerInstance(
 	if preflightCreds, err := agent.credentialProvider.Get(); err != nil || preflightCreds.AccessKeyID == "" {
 		seelog.Warnf("Error getting valid credentials (AKID %s): %v", preflightCreds.AccessKeyID, err)
 	}
-	capabilities := append(agent.capabilities(), additionalAttributes...)
+
+	agentCapabilities, err := agent.capabilities()
+	if err != nil {
+		return err
+	}
+	capabilities := append(agentCapabilities, additionalAttributes...)
 
 	if agent.containerInstanceARN != "" {
 		seelog.Infof("Restored from checkpoint file. I am running as '%s' in cluster '%s'", agent.containerInstanceARN, agent.cfg.Cluster)
@@ -424,6 +469,10 @@ func (agent *ecsAgent) registerContainerInstance(
 	if err != nil {
 		seelog.Errorf("Error registering: %v", err)
 		if retriable, ok := err.(utils.Retriable); ok && !retriable.Retry() {
+			return err
+		}
+		if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == ecs.ErrCodeInvalidParameterException {
+			seelog.Critical("Instance registration attempt with an invalid parameter")
 			return err
 		}
 		if _, ok := err.(utils.AttributeError); ok {
@@ -475,7 +524,7 @@ func (agent *ecsAgent) startAsyncRoutines(
 		go imageManager.StartImageCleanupProcess(agent.ctx)
 	}
 
-	go sighandlers.StartTerminationHandler(stateManager, taskEngine)
+	go agent.terminationHandler(stateManager, taskEngine)
 
 	// Agent introspection api
 	go handlers.ServeHttp(&agent.containerInstanceARN, taskEngine, agent.cfg)

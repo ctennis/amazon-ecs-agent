@@ -17,16 +17,20 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+
+	"github.com/aws/amazon-ecs-agent/agent/credentials"
 )
 
 const (
-	// DockerContainerMinimumMemoryInBytes is the minimum amount of
-	// memory to be allocated to a docker container
-	DockerContainerMinimumMemoryInBytes = 4 * 1024 * 1024 // 4MB
 	// defaultContainerSteadyStateStatus defines the container status at
 	// which the container is assumed to be in steady state. It is set
 	// to 'ContainerRunning' unless overridden
 	defaultContainerSteadyStateStatus = ContainerRunning
+
+	// awslogsAuthExecutionRole is the string value passed in the task payload
+	// that specifies that the log driver should be authenticated using the
+	// execution role
+	awslogsAuthExecutionRole = "ExecutionRole"
 )
 
 // DockerConfig represents additional metadata about a container to run. It's
@@ -60,6 +64,10 @@ type Container struct {
 	Overrides              ContainerOverrides          `json:"overrides"`
 	DockerConfig           DockerConfig                `json:"dockerConfig"`
 	RegistryAuthentication *RegistryAuthenticationData `json:"registryAuthentication"`
+
+	// LogsAuthStrategy specifies how the logs driver for the container will be
+	// authenticated
+	LogsAuthStrategy string
 
 	// lock is used for fields that are accessed and updated concurrently
 	lock sync.RWMutex
@@ -225,16 +233,37 @@ func (c *Container) SetSentStatus(status ContainerStatus) {
 	c.SentStatusUnsafe = status
 }
 
+// SetKnownExitCode sets exit code field in container struct
 func (c *Container) SetKnownExitCode(i *int) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.knownExitCode = i
 }
 
+// GetKnownExitCode returns the container exit code
 func (c *Container) GetKnownExitCode() *int {
 	c.lock.RLock()
 	defer c.lock.RUnlock()
 	return c.knownExitCode
+}
+
+// SetRegistryAuthCredentials sets the credentials for pulling image from ECR
+func (c *Container) SetRegistryAuthCredentials(credential credentials.IAMRoleCredentials) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	c.RegistryAuthentication.ECRAuthData.SetPullCredentials(credential)
+}
+
+// ShouldPullWithExecutionRole returns whether this container has its own ECR credentials
+func (c *Container) ShouldPullWithExecutionRole() bool {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	return c.RegistryAuthentication != nil &&
+		c.RegistryAuthentication.Type == "ecr" &&
+		c.RegistryAuthentication.ECRAuthData != nil &&
+		c.RegistryAuthentication.ECRAuthData.UseExecutionRole
 }
 
 // String returns a human readable string representation of this object
@@ -324,4 +353,17 @@ func (c *Container) SetMetadataFileUpdated() {
 	defer c.lock.Unlock()
 
 	c.MetadataFileUpdated = true
+}
+
+// IsEssential returns whether the container is an essential container or not
+func (c *Container) IsEssential() bool {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+
+	return c.Essential
+}
+
+// LogAuthExecutionRole returns true if the auth is by exectution role
+func (c *Container) AWSLogAuthExecutionRole() bool {
+	return c.LogsAuthStrategy == awslogsAuthExecutionRole
 }

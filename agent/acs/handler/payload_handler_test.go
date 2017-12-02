@@ -38,31 +38,61 @@ const (
 	payloadMessageId     = "123"
 )
 
-// TestHandlePayloadMessageWithNoMessageId tests that agent doesn't ack payload messages
-// that do not contain message ids
-func TestHandlePayloadMessageWithNoMessageId(t *testing.T) {
+// testHelper wraps all the object required for the test
+type testHelper struct {
+	ctrl               *gomock.Controller
+	payloadHandler     payloadRequestHandler
+	mockTaskEngine     *engine.MockTaskEngine
+	ecsClient          api.ECSClient
+	mockWsClient       *mock_wsclient.MockClientServer
+	saver              statemanager.Saver
+	credentialsManager credentials.Manager
+	eventHandler       *eventhandler.TaskHandler
+	ctx                context.Context
+	cancel             context.CancelFunc
+}
+
+func setup(t *testing.T) *testHelper {
 	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
 	taskEngine := engine.NewMockTaskEngine(ctrl)
 	ecsClient := mock_api.NewMockECSClient(ctrl)
+	mockWsClient := mock_wsclient.NewMockClientServer(ctrl)
 	stateManager := statemanager.NewNoopStateManager()
 	credentialsManager := credentials.NewManager()
 	ctx, cancel := context.WithCancel(context.Background())
 	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
-	defer cancel()
 
-	buffer := newPayloadRequestHandler(
+	handler := newPayloadRequestHandler(
 		ctx,
 		taskEngine,
 		ecsClient,
 		clusterName,
 		containerInstanceArn,
-		nil,
+		mockWsClient,
 		stateManager,
 		refreshCredentialsHandler{},
 		credentialsManager,
 		taskHandler)
 
+	return &testHelper{
+		ctrl:               ctrl,
+		payloadHandler:     handler,
+		mockTaskEngine:     taskEngine,
+		ecsClient:          ecsClient,
+		mockWsClient:       mockWsClient,
+		saver:              stateManager,
+		credentialsManager: credentialsManager,
+		eventHandler:       taskHandler,
+		ctx:                ctx,
+		cancel:             cancel,
+	}
+}
+
+// TestHandlePayloadMessageWithNoMessageId tests that agent doesn't ack payload messages
+// that do not contain message ids
+func TestHandlePayloadMessageWithNoMessageId(t *testing.T) {
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 	// test adding a payload message without the MessageId field
 	payloadMessage := &ecsacs.PayloadMessage{
 		Tasks: []*ecsacs.Task{
@@ -71,48 +101,23 @@ func TestHandlePayloadMessageWithNoMessageId(t *testing.T) {
 			},
 		},
 	}
-	err := buffer.handleSingleMessage(payloadMessage)
-	if err == nil {
-		t.Error("Expected error while adding a task with no message id")
-	}
+	err := tester.payloadHandler.handleSingleMessage(payloadMessage)
+	assert.Error(t, err, "Expected error while adding a task with no message id")
 
 	// test adding a payload message with blank MessageId
 	payloadMessage.MessageId = aws.String("")
-	err = buffer.handleSingleMessage(payloadMessage)
-
-	if err == nil {
-		t.Error("Expected error while adding a task with no message id")
-	}
-
+	err = tester.payloadHandler.handleSingleMessage(payloadMessage)
+	assert.Error(t, err, "Expected error while adding a task with no message id")
 }
 
 // TestHandlePayloadMessageAddTaskError tests that agent does not ack payload messages
 // when task engine fails to add tasks
 func TestHandlePayloadMessageAddTaskError(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	taskEngine := engine.NewMockTaskEngine(ctrl)
-	ecsClient := mock_api.NewMockECSClient(ctrl)
-	stateManager := statemanager.NewNoopStateManager()
-	credentialsManager := credentials.NewManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
-	defer cancel()
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 
 	// Return error from AddTask
-	taskEngine.EXPECT().AddTask(gomock.Any()).Return(fmt.Errorf("oops")).Times(2)
-
-	buffer := newPayloadRequestHandler(
-		ctx,
-		taskEngine,
-		ecsClient,
-		clusterName,
-		containerInstanceArn,
-		nil,
-		stateManager,
-		refreshCredentialsHandler{},
-		credentialsManager,
-		taskHandler)
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Return(fmt.Errorf("oops")).Times(2)
 
 	// Test AddTask error with RUNNING task
 	payloadMessage := &ecsacs.PayloadMessage{
@@ -124,10 +129,8 @@ func TestHandlePayloadMessageAddTaskError(t *testing.T) {
 		},
 		MessageId: aws.String(payloadMessageId),
 	}
-	err := buffer.handleSingleMessage(payloadMessage)
-	if err == nil {
-		t.Error("Expected error while adding the task")
-	}
+	err := tester.payloadHandler.handleSingleMessage(payloadMessage)
+	assert.Error(t, err, "Expected error while adding the task")
 
 	payloadMessage = &ecsacs.PayloadMessage{
 		Tasks: []*ecsacs.Task{
@@ -139,48 +142,29 @@ func TestHandlePayloadMessageAddTaskError(t *testing.T) {
 		MessageId: aws.String(payloadMessageId),
 	}
 	// Test AddTask error with STOPPED task
-	err = buffer.handleSingleMessage(payloadMessage)
-	if err == nil {
-		t.Error("Expected error while adding the task")
-	}
+	err = tester.payloadHandler.handleSingleMessage(payloadMessage)
+	assert.Error(t, err, "Expected error while adding the task")
 }
 
 // TestHandlePayloadMessageStateSaveError tests that agent does not ack payload messages
 // when state saver fails to save state
 func TestHandlePayloadMessageStateSaveError(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	ecsClient := mock_api.NewMockECSClient(ctrl)
-	credentialsManager := credentials.NewManager()
-	stateManager := mock_statemanager.NewMockStateManager(ctrl)
-	taskEngine := engine.NewMockTaskEngine(ctrl)
-	ctx, cancel := context.WithCancel(context.Background())
-	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
-	defer cancel()
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 
 	// Save added task in the addedTask variable
 	var addedTask *api.Task
-	taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
 		addedTask = task
 	}).Times(1)
 
+	stateManager := mock_statemanager.NewMockStateManager(tester.ctrl)
+	tester.payloadHandler.saver = stateManager
 	// State manager returns error on save
 	stateManager.EXPECT().Save().Return(fmt.Errorf("oops"))
 
-	buffer := newPayloadRequestHandler(
-		ctx,
-		taskEngine,
-		ecsClient,
-		clusterName,
-		containerInstanceArn,
-		nil,
-		stateManager,
-		refreshCredentialsHandler{},
-		credentialsManager,
-		taskHandler)
-
 	// Check if handleSingleMessage returns an error when state manager returns error on Save()
-	err := buffer.handleSingleMessage(&ecsacs.PayloadMessage{
+	err := tester.payloadHandler.handleSingleMessage(&ecsacs.PayloadMessage{
 		Tasks: []*ecsacs.Task{
 			{
 				Arn: aws.String("t1"),
@@ -188,55 +172,34 @@ func TestHandlePayloadMessageStateSaveError(t *testing.T) {
 		},
 		MessageId: aws.String(payloadMessageId),
 	})
-	if err == nil {
-		t.Error("Expected error while adding a task from statemanager")
-	}
+	assert.Error(t, err, "Expected error while adding a task from statemanager")
 
 	// We expect task to be added to the engine even though it hasn't been saved
 	expectedTask := &api.Task{
 		Arn: "t1",
 	}
-	if !reflect.DeepEqual(addedTask, expectedTask) {
-		t.Errorf("Mismatch between expected and added tasks, expected: %v, added: %v", expectedTask, addedTask)
-	}
+
+	assert.Equal(t, addedTask, expectedTask, "added task is not expected")
 }
 
 // TestHandlePayloadMessageAckedWhenTaskAdded tests if the handler generates an ack
 // after processing a payload message.
 func TestHandlePayloadMessageAckedWhenTaskAdded(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	ecsClient := mock_api.NewMockECSClient(ctrl)
-	stateManager := statemanager.NewNoopStateManager()
-	credentialsManager := credentials.NewManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 
-	taskEngine := engine.NewMockTaskEngine(ctrl)
 	var addedTask *api.Task
-	taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
 		addedTask = task
 	}).Times(1)
 
 	var ackRequested *ecsacs.AckRequest
-	mockWsClient := mock_wsclient.NewMockClientServer(ctrl)
-	mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
+	tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
 		ackRequested = ackRequest
-		cancel()
+		tester.cancel()
 	}).Times(1)
-	buffer := newPayloadRequestHandler(
-		ctx,
-		taskEngine,
-		ecsClient,
-		clusterName,
-		containerInstanceArn,
-		mockWsClient,
-		stateManager,
-		refreshCredentialsHandler{},
-		credentialsManager,
-		taskHandler)
 
-	go buffer.start()
+	go tester.payloadHandler.start()
 
 	// Send a payload message
 	payloadMessage := &ecsacs.PayloadMessage{
@@ -247,81 +210,57 @@ func TestHandlePayloadMessageAckedWhenTaskAdded(t *testing.T) {
 		},
 		MessageId: aws.String(payloadMessageId),
 	}
-	err := buffer.handleSingleMessage(payloadMessage)
-	if err != nil {
-		t.Errorf("Error handling payload message: %v", err)
-	}
+	err := tester.payloadHandler.handleSingleMessage(payloadMessage)
+	assert.NoError(t, err, "Error handling payload message")
 
 	// Wait till we get an ack from the ackBuffer
 	select {
-	case <-ctx.Done():
+	case <-tester.ctx.Done():
 	}
 	// Verify the message id acked
-	if aws.StringValue(ackRequested.MessageId) != payloadMessageId {
-		t.Errorf("Message Id mismatch. Expected: %s, got: %s", payloadMessageId, aws.StringValue(ackRequested.MessageId))
-	}
+	assert.Equal(t, aws.StringValue(ackRequested.MessageId), payloadMessageId, "received message is not expected")
 
 	// Verify if task added == expected task
 	expectedTask := &api.Task{
 		Arn: "t1",
 	}
-	if !reflect.DeepEqual(addedTask, expectedTask) {
-		t.Errorf("Mismatch between expected and added tasks, expected: %v, added: %v", expectedTask, addedTask)
-	}
+	assert.Equal(t, addedTask, expectedTask, "received task is not expected")
 }
 
 // TestHandlePayloadMessageCredentialsAckedWhenTaskAdded tests if the handler generates
 // an ack after processing a payload message when the payload message contains a task
 // with an IAM Role. It also tests if the credentials ack is generated
 func TestHandlePayloadMessageCredentialsAckedWhenTaskAdded(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	ecsClient := mock_api.NewMockECSClient(ctrl)
-	stateManager := statemanager.NewNoopStateManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 
-	taskEngine := engine.NewMockTaskEngine(ctrl)
 	var addedTask *api.Task
-	taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
 		addedTask = task
 	}).Times(1)
 
 	var payloadAckRequested *ecsacs.AckRequest
 	var taskCredentialsAckRequested *ecsacs.IAMRoleCredentialsAckRequest
-	mockWsClient := mock_wsclient.NewMockClientServer(ctrl)
 	// The payload message in the test consists of a task, with credentials set
 	// Record the credentials ack and the payload message ack
 	gomock.InOrder(
-		mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.IAMRoleCredentialsAckRequest) {
+		tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.IAMRoleCredentialsAckRequest) {
 			taskCredentialsAckRequested = ackRequest
 		}),
-		mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
+		tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
 			payloadAckRequested = ackRequest
 			// Cancel the context when the ack for the payload message is received
 			// This signals a successful workflow in the test
-			cancel()
+			tester.cancel()
 		}),
 	)
 
-	refreshCredsHandler := newRefreshCredentialsHandler(ctx, clusterName, containerInstanceArn, mockWsClient, credentialsManager, taskEngine)
+	refreshCredsHandler := newRefreshCredentialsHandler(tester.ctx, clusterName, containerInstanceArn, tester.mockWsClient, tester.credentialsManager, tester.mockTaskEngine)
 	defer refreshCredsHandler.clearAcks()
 	refreshCredsHandler.start()
+	tester.payloadHandler.refreshHandler = refreshCredsHandler
 
-	payloadHandler := newPayloadRequestHandler(
-		ctx,
-		taskEngine,
-		ecsClient,
-		clusterName,
-		containerInstanceArn,
-		mockWsClient,
-		stateManager,
-		refreshCredsHandler,
-		credentialsManager,
-		taskHandler)
-
-	go payloadHandler.start()
+	go tester.payloadHandler.start()
 
 	taskArn := "t1"
 	credentialsExpiration := "expiration"
@@ -350,20 +289,16 @@ func TestHandlePayloadMessageCredentialsAckedWhenTaskAdded(t *testing.T) {
 		ClusterArn:           aws.String(cluster),
 		ContainerInstanceArn: aws.String(containerInstance),
 	}
-	err := payloadHandler.handleSingleMessage(payloadMessage)
-	if err != nil {
-		t.Errorf("Error handling payload message: %v", err)
-	}
+	err := tester.payloadHandler.handleSingleMessage(payloadMessage)
+	assert.NoError(t, err, "error handling payload message")
 
 	// Wait till we get an ack from the ackBuffer
 	select {
-	case <-ctx.Done():
+	case <-tester.ctx.Done():
 	}
 
 	// Verify the message id acked
-	if aws.StringValue(payloadAckRequested.MessageId) != payloadMessageId {
-		t.Errorf("Message Id mismatch. Expected: %s, got: %s", payloadMessageId, aws.StringValue(payloadAckRequested.MessageId))
-	}
+	assert.Equal(t, aws.StringValue(payloadAckRequested.MessageId), payloadMessageId, "received message is not expected")
 
 	// Verify the correctness of the task added to the engine and the
 	// credentials ack generated for it
@@ -381,26 +316,17 @@ func TestHandlePayloadMessageCredentialsAckedWhenTaskAdded(t *testing.T) {
 		CredentialsID:   credentialsId,
 	}
 	err = validateTaskAndCredentials(taskCredentialsAckRequested, expectedCredentialsAck, addedTask, taskArn, expectedCredentials)
-	if err != nil {
-		t.Errorf("Error validating added task or credentials ack for the same: %v", err)
-	}
+	assert.NoError(t, err, "error validating added task or credentials ack for the same")
 }
 
 // TestAddPayloadTaskAddsNonStoppedTasksAfterStoppedTasks tests if tasks with desired status
 // 'RUNNING' are added after tasks with desired status 'STOPPED'
 func TestAddPayloadTaskAddsNonStoppedTasksAfterStoppedTasks(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	ecsClient := mock_api.NewMockECSClient(ctrl)
-	taskEngine := engine.NewMockTaskEngine(ctrl)
-	credentialsManager := credentials.NewManager()
-	stateManager := statemanager.NewNoopStateManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
-	defer cancel()
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 
 	var tasksAddedToEngine []*api.Task
-	taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
 		tasksAddedToEngine = append(tasksAddedToEngine, task)
 	}).Times(2)
 
@@ -420,19 +346,7 @@ func TestAddPayloadTaskAddsNonStoppedTasksAfterStoppedTasks(t *testing.T) {
 		MessageId: aws.String(payloadMessageId),
 	}
 
-	buffer := newPayloadRequestHandler(
-		ctx,
-		taskEngine,
-		ecsClient,
-		clusterName,
-		containerInstanceArn,
-		nil,
-		stateManager,
-		refreshCredentialsHandler{},
-		credentialsManager,
-		taskHandler)
-
-	_, ok := buffer.addPayloadTasks(payloadMessage)
+	_, ok := tester.payloadHandler.addPayloadTasks(payloadMessage)
 	assert.True(t, ok)
 	assert.Len(t, tasksAddedToEngine, 2)
 
@@ -449,43 +363,24 @@ func TestAddPayloadTaskAddsNonStoppedTasksAfterStoppedTasks(t *testing.T) {
 // TestPayloadBufferHandler tests if the async payloadBufferHandler routine
 // acks messages after adding tasks
 func TestPayloadBufferHandler(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	taskEngine := engine.NewMockTaskEngine(ctrl)
-	ecsClient := mock_api.NewMockECSClient(ctrl)
-	stateManager := statemanager.NewNoopStateManager()
-	credentialsManager := credentials.NewManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 
 	var addedTask *api.Task
-	taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
 		addedTask = task
 	}).Times(1)
 
 	var ackRequested *ecsacs.AckRequest
-	mockWsClient := mock_wsclient.NewMockClientServer(ctrl)
-	mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
+	tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
 		ackRequested = ackRequest
-		cancel()
+		tester.cancel()
 	}).Times(1)
 
-	buffer := newPayloadRequestHandler(
-		ctx,
-		taskEngine,
-		ecsClient,
-		clusterName,
-		containerInstanceArn,
-		mockWsClient,
-		stateManager,
-		refreshCredentialsHandler{},
-		credentialsManager,
-		taskHandler)
-
-	go buffer.start()
+	go tester.payloadHandler.start()
 	// Send a payload message to the payloadBufferChannel
 	taskArn := "t1"
-	buffer.messageBuffer <- &ecsacs.PayloadMessage{
+	tester.payloadHandler.messageBuffer <- &ecsacs.PayloadMessage{
 		Tasks: []*ecsacs.Task{
 			{
 				Arn: aws.String(taskArn),
@@ -496,43 +391,33 @@ func TestPayloadBufferHandler(t *testing.T) {
 
 	// Wait till we get an ack
 	select {
-	case <-ctx.Done():
+	case <-tester.ctx.Done():
 	}
 	// Verify if payloadMessageId read from the ack buffer is correct
-	if aws.StringValue(ackRequested.MessageId) != payloadMessageId {
-		t.Errorf("Message Id mismatch. Expected: %s, got: %s", payloadMessageId, aws.StringValue(ackRequested.MessageId))
-	}
+	assert.Equal(t, aws.StringValue(ackRequested.MessageId), payloadMessageId, "received task is not expected")
 
 	// Verify if the task added to the engine is correct
 	expectedTask := &api.Task{
 		Arn: taskArn,
 	}
-	if !reflect.DeepEqual(addedTask, expectedTask) {
-		t.Errorf("Mismatch between expected and added tasks, expected: %v, added: %v", expectedTask, addedTask)
-	}
+	assert.Equal(t, addedTask, expectedTask, "received task is not expected")
 }
 
 // TestPayloadBufferHandlerWithCredentials tests if the async payloadBufferHandler routine
 // acks the payload message and credentials after adding tasks
 func TestPayloadBufferHandlerWithCredentials(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-	ecsClient := mock_api.NewMockECSClient(ctrl)
-	stateManager := statemanager.NewNoopStateManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	credentialsManager := credentials.NewManager()
-	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 
 	// The payload message in the test consists of two tasks, record both of them in
 	// the order in which they were added
-	taskEngine := engine.NewMockTaskEngine(ctrl)
 	var firstAddedTask *api.Task
 	var secondAddedTask *api.Task
 	gomock.InOrder(
-		taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+		tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
 			firstAddedTask = task
 		}),
-		taskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+		tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
 			secondAddedTask = task
 		}),
 	)
@@ -542,38 +427,27 @@ func TestPayloadBufferHandlerWithCredentials(t *testing.T) {
 	var payloadAckRequested *ecsacs.AckRequest
 	var firstTaskCredentialsAckRequested *ecsacs.IAMRoleCredentialsAckRequest
 	var secondTaskCredentialsAckRequested *ecsacs.IAMRoleCredentialsAckRequest
-	mockWsClient := mock_wsclient.NewMockClientServer(ctrl)
 	gomock.InOrder(
-		mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.IAMRoleCredentialsAckRequest) {
+		tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.IAMRoleCredentialsAckRequest) {
 			firstTaskCredentialsAckRequested = ackRequest
 		}),
-		mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.IAMRoleCredentialsAckRequest) {
+		tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.IAMRoleCredentialsAckRequest) {
 			secondTaskCredentialsAckRequested = ackRequest
 		}),
-		mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
+		tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
 			payloadAckRequested = ackRequest
 			// Cancel the context when the ack for the payload message is received
 			// This signals a successful workflow in the test
-			cancel()
+			tester.cancel()
 		}),
 	)
 
-	refreshCredsHandler := newRefreshCredentialsHandler(ctx, clusterName, containerInstanceArn, mockWsClient, credentialsManager, taskEngine)
+	refreshCredsHandler := newRefreshCredentialsHandler(tester.ctx, clusterName, containerInstanceArn, tester.mockWsClient, tester.credentialsManager, tester.mockTaskEngine)
 	defer refreshCredsHandler.clearAcks()
 	refreshCredsHandler.start()
-	payloadHandler := newPayloadRequestHandler(
-		ctx,
-		taskEngine,
-		ecsClient,
-		clusterName,
-		containerInstanceArn,
-		mockWsClient,
-		stateManager,
-		refreshCredsHandler,
-		credentialsManager,
-		taskHandler)
+	tester.payloadHandler.refreshHandler = refreshCredsHandler
 
-	go payloadHandler.start()
+	go tester.payloadHandler.start()
 
 	firstTaskArn := "t1"
 	firstTaskCredentialsExpiration := "expiration"
@@ -592,7 +466,7 @@ func TestPayloadBufferHandlerWithCredentials(t *testing.T) {
 	secondTaskCredentialsId := "credsid2"
 
 	// Send a payload message to the payloadBufferChannel
-	payloadHandler.messageBuffer <- &ecsacs.PayloadMessage{
+	tester.payloadHandler.messageBuffer <- &ecsacs.PayloadMessage{
 		Tasks: []*ecsacs.Task{
 			{
 				Arn: aws.String(firstTaskArn),
@@ -624,13 +498,11 @@ func TestPayloadBufferHandlerWithCredentials(t *testing.T) {
 
 	// Wait till we get an ack
 	select {
-	case <-ctx.Done():
+	case <-tester.ctx.Done():
 	}
 
 	// Verify if payloadMessageId read from the ack buffer is correct
-	if aws.StringValue(payloadAckRequested.MessageId) != payloadMessageId {
-		t.Errorf("Message Id mismatch. Expected: %s, got: %s", payloadMessageId, aws.StringValue(payloadAckRequested.MessageId))
-	}
+	assert.Equal(t, aws.StringValue(payloadAckRequested.MessageId), payloadMessageId, "received message is not expected")
 
 	// Verify the correctness of the first task added to the engine and the
 	// credentials ack generated for it
@@ -648,9 +520,7 @@ func TestPayloadBufferHandlerWithCredentials(t *testing.T) {
 		CredentialsID:   firstTaskCredentialsId,
 	}
 	err := validateTaskAndCredentials(firstTaskCredentialsAckRequested, expectedCredentialsAckForFirstTask, firstAddedTask, firstTaskArn, expectedCredentialsForFirstTask)
-	if err != nil {
-		t.Errorf("Error validating added task or credentials ack for the same: %v", err)
-	}
+	assert.NoError(t, err, "error validating added task or credentials ack for the same")
 
 	// Verify the correctness of the second task added to the engine and the
 	// credentials ack generated for it
@@ -668,15 +538,93 @@ func TestPayloadBufferHandlerWithCredentials(t *testing.T) {
 		CredentialsID:   secondTaskCredentialsId,
 	}
 	err = validateTaskAndCredentials(secondTaskCredentialsAckRequested, expectedCredentialsAckForSecondTask, secondAddedTask, secondTaskArn, expectedCredentialsForSecondTask)
-	if err != nil {
-		t.Errorf("Error validating added task or credentials ack for the same: %v", err)
+	assert.NoError(t, err, "error validating added task or credentials ack for the same")
+}
+
+// TestAddPayloadTaskAddsExecutionRoles tests the payload handler will add
+// execution role credentials to the credentials manager and the field in
+// task and container are appropriately set
+func TestAddPayloadTaskAddsExecutionRoles(t *testing.T) {
+	tester := setup(t)
+	defer tester.ctrl.Finish()
+
+	var addedTask *api.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+		addedTask = task
+	})
+
+	var ackRequested *ecsacs.AckRequest
+	var executionCredentialsAckRequested *ecsacs.IAMRoleCredentialsAckRequest
+	gomock.InOrder(
+		tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.IAMRoleCredentialsAckRequest) {
+			executionCredentialsAckRequested = ackRequest
+		}),
+		tester.mockWsClient.EXPECT().MakeRequest(gomock.Any()).Do(func(ackRequest *ecsacs.AckRequest) {
+			ackRequested = ackRequest
+			tester.cancel()
+		}),
+	)
+	refreshCredsHandler := newRefreshCredentialsHandler(tester.ctx, clusterName, containerInstanceArn, tester.mockWsClient, tester.credentialsManager, tester.mockTaskEngine)
+	defer refreshCredsHandler.clearAcks()
+	refreshCredsHandler.start()
+
+	tester.payloadHandler.refreshHandler = refreshCredsHandler
+	go tester.payloadHandler.start()
+	taskArn := "t1"
+	credentialsExpiration := "expiration"
+	credentialsRoleArn := "r1"
+	credentialsAccessKey := "akid"
+	credentialsSecretKey := "skid"
+	credentialsSessionToken := "token"
+	credentialsID := "credsid"
+
+	tester.payloadHandler.messageBuffer <- &ecsacs.PayloadMessage{
+		Tasks: []*ecsacs.Task{
+			{
+				Arn: aws.String(taskArn),
+				ExecutionRoleCredentials: &ecsacs.IAMRoleCredentials{
+					AccessKeyId:     aws.String(credentialsAccessKey),
+					Expiration:      aws.String(credentialsExpiration),
+					RoleArn:         aws.String(credentialsRoleArn),
+					SecretAccessKey: aws.String(credentialsSecretKey),
+					SessionToken:    aws.String(credentialsSessionToken),
+					CredentialsId:   aws.String(credentialsID),
+				},
+			},
+		},
+		MessageId: aws.String(payloadMessageId),
 	}
+
+	// Wait till we get an ack
+	select {
+	case <-tester.ctx.Done():
+	}
+	// Verify if payloadMessageId read from the ack buffer is correct
+	assert.Equal(t, aws.StringValue(ackRequested.MessageId), payloadMessageId, "received message not expected")
+	assert.Equal(t, "credsid", addedTask.GetExecutionCredentialsID(), "task execution role credentials id mismatch")
+
+	// Verify the credentials in the payload message was stored in the credentials manager
+	iamRoleCredentials, ok := tester.credentialsManager.GetTaskCredentials("credsid")
+	assert.True(t, ok, "execution role credentials not found in credentials manager")
+	assert.Equal(t, credentialsRoleArn, iamRoleCredentials.IAMRoleCredentials.RoleArn)
+	assert.Equal(t, taskArn, iamRoleCredentials.ARN)
+	assert.Equal(t, credentialsExpiration, iamRoleCredentials.IAMRoleCredentials.Expiration)
+	assert.Equal(t, credentialsAccessKey, iamRoleCredentials.IAMRoleCredentials.AccessKeyID)
+	assert.Equal(t, credentialsSecretKey, iamRoleCredentials.IAMRoleCredentials.SecretAccessKey)
+	assert.Equal(t, credentialsSessionToken, iamRoleCredentials.IAMRoleCredentials.SessionToken)
+	assert.Equal(t, credentialsID, iamRoleCredentials.IAMRoleCredentials.CredentialsID)
+	assert.Equal(t, credentialsID, *executionCredentialsAckRequested.CredentialsId)
+	assert.Equal(t, payloadMessageId, *executionCredentialsAckRequested.MessageId)
 }
 
 // validateTaskAndCredentials compares a task and a credentials ack object
 // against expected values. It returns an error if either of the the
 // comparisons fail
-func validateTaskAndCredentials(taskCredentialsAck, expectedCredentialsAckForTask *ecsacs.IAMRoleCredentialsAckRequest, addedTask *api.Task, expectedTaskArn string, expectedTaskCredentials credentials.IAMRoleCredentials) error {
+func validateTaskAndCredentials(taskCredentialsAck,
+	expectedCredentialsAckForTask *ecsacs.IAMRoleCredentialsAckRequest,
+	addedTask *api.Task,
+	expectedTaskArn string,
+	expectedTaskCredentials credentials.IAMRoleCredentials) error {
 	if !reflect.DeepEqual(taskCredentialsAck, expectedCredentialsAckForTask) {
 		return fmt.Errorf("Mismatch between expected and received credentials ack requests, expected: %s, got: %s", expectedCredentialsAckForTask.String(), taskCredentialsAck.String())
 	}
@@ -693,19 +641,11 @@ func validateTaskAndCredentials(taskCredentialsAck, expectedCredentialsAckForTas
 }
 
 func TestPayloadHandlerAddedENIToTask(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
+	tester := setup(t)
+	defer tester.ctrl.Finish()
 
-	ecsClient := mock_api.NewMockECSClient(ctrl)
-	stateManager := statemanager.NewNoopStateManager()
-	credentialsManager := credentials.NewManager()
-	ctx, cancel := context.WithCancel(context.Background())
-	taskHandler := eventhandler.NewTaskHandler(ctx, stateManager, nil, nil)
-	defer cancel()
-
-	taskEngine := engine.NewMockTaskEngine(ctrl)
 	var addedTask *api.Task
-	taskEngine.EXPECT().AddTask(gomock.Any()).Do(
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(
 		func(task *api.Task) {
 			addedTask = task
 		})
@@ -737,18 +677,7 @@ func TestPayloadHandlerAddedENIToTask(t *testing.T) {
 		MessageId: aws.String(payloadMessageId),
 	}
 
-	buffer := newPayloadRequestHandler(
-		ctx,
-		taskEngine,
-		ecsClient,
-		clusterName,
-		containerInstanceArn,
-		nil,
-		stateManager,
-		refreshCredentialsHandler{},
-		credentialsManager,
-		taskHandler)
-	err := buffer.handleSingleMessage(payloadMessage)
+	err := tester.payloadHandler.handleSingleMessage(payloadMessage)
 	assert.NoError(t, err)
 
 	// Validate the added task has the eni information as expected

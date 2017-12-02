@@ -42,20 +42,6 @@
         {"shape":"UnsupportedFeatureException"}
       ]
     },
-    "CreateServiceLinkedRole":{
-      "name":"CreateServiceLinkedRole",
-      "http":{
-        "method":"POST",
-        "requestUri":"/"
-      },
-      "input":{"shape":"CreateServiceLinkedRoleRequest"},
-      "output":{"shape":"CreateServiceLinkedRoleResponse"},
-      "errors":[
-        {"shape":"ServerException"},
-        {"shape":"ClientException"},
-        {"shape":"InvalidParameterException"}
-      ]
-    },
     "DeleteAttributes":{
       "name":"DeleteAttributes",
       "http":{
@@ -344,7 +330,8 @@
       "output":{"shape":"RegisterContainerInstanceResponse"},
       "errors":[
         {"shape":"ServerException"},
-        {"shape":"ClientException"}
+        {"shape":"ClientException"},
+        {"shape":"InvalidParameterException"}
       ]
     },
     "RegisterTaskDefinition":{
@@ -565,6 +552,18 @@
       "type":"integer",
       "box":true
     },
+    "DeviceCgroupPermission":{
+      "type":"string",
+      "enum":[
+        "read",
+        "write",
+        "mknod"
+      ]
+    },
+    "DeviceCgroupPermissions":{
+      "type":"list",
+      "member":{"shape":"DeviceCgroupPermission"}
+    },
     "ClientException":{
       "type":"structure",
       "members":{
@@ -730,16 +729,6 @@
         "cluster":{"shape":"Cluster"}
       }
     },
-    "CreateServiceLinkedRoleRequest":{
-      "type":"structure",
-      "members":{
-      }
-    },
-    "CreateServiceLinkedRoleResponse":{
-      "type":"structure",
-      "members":{
-      }
-    },
     "CreateServiceRequest":{
       "type":"structure",
       "required":[
@@ -754,7 +743,6 @@
         "loadBalancers":{"shape":"LoadBalancers"},
         "desiredCount":{"shape":"BoxedInteger"},
         "clientToken":{"shape":"String"},
-        "platformVersion":{"shape":"String"},
         "role":{"shape":"String"},
         "deploymentConfiguration":{"shape":"DeploymentConfiguration"},
         "placementConstraints":{"shape":"PlacementConstraints"},
@@ -820,7 +808,6 @@
         "runningCount":{"shape":"Integer"},
         "createdAt":{"shape":"Timestamp"},
         "updatedAt":{"shape":"Timestamp"},
-        "platformVersion":{"shape":"String"},
         "networkConfiguration":{"shape":"NetworkConfiguration"}
       }
     },
@@ -942,6 +929,19 @@
         "STOPPED"
       ]
     },
+    "Device":{
+      "type":"structure",
+      "required":["hostPath"],
+      "members":{
+        "hostPath":{"shape":"String"},
+        "containerPath":{"shape":"String"},
+        "permissions":{"shape":"DeviceCgroupPermissions"}
+      }
+    },
+    "DevicesList":{
+      "type":"list",
+      "member":{"shape":"Device"}
+    },
     "DiscoverPollEndpointRequest":{
       "type":"structure",
       "members":{
@@ -1022,7 +1022,9 @@
     "LinuxParameters":{
       "type":"structure",
       "members":{
-        "capabilities":{"shape":"KernelCapabilities"}
+        "capabilities":{"shape":"KernelCapabilities"},
+        "devices":{"shape":"DevicesList"},
+        "initProcessEnabled":{"shape":"BoxedBoolean"}
       }
     },
     "ListAttributesRequest":{
@@ -1295,6 +1297,10 @@
       "type":"list",
       "member":{"shape":"PortMapping"}
     },
+    "Properties":{
+      "type":"list",
+      "member":{"shape":"KeyValuePair"}
+    },
     "PutAttributesRequest":{
       "type":"structure",
       "required":["attributes"],
@@ -1336,6 +1342,7 @@
       "members":{
         "family":{"shape":"String"},
         "taskRoleArn":{"shape":"String"},
+        "executionRoleArn":{"shape":"String"},
         "networkMode":{"shape":"NetworkMode"},
         "containerDefinitions":{"shape":"ContainerDefinitions"},
         "volumes":{"shape":"VolumeList"},
@@ -1381,7 +1388,6 @@
         "group":{"shape":"String"},
         "placementConstraints":{"shape":"PlacementConstraints"},
         "placementStrategy":{"shape":"PlacementStrategies"},
-        "platformVersion":{"shape":"String"},
         "networkConfiguration":{"shape":"NetworkConfiguration"}
       }
     },
@@ -1411,7 +1417,6 @@
         "desiredCount":{"shape":"Integer"},
         "runningCount":{"shape":"Integer"},
         "pendingCount":{"shape":"Integer"},
-        "platformVersion":{"shape":"String"},
         "taskDefinition":{"shape":"String"},
         "deploymentConfiguration":{"shape":"DeploymentConfiguration"},
         "deployments":{"shape":"Deployments"},
@@ -1471,7 +1476,8 @@
         "containerInstances":{"shape":"StringList"},
         "startedBy":{"shape":"String"},
         "group":{"shape":"String"},
-        "networkConfiguration":{"shape":"NetworkConfiguration"}
+        "networkConfiguration":{"shape":"NetworkConfiguration"},
+        "properties":{"shape":"Properties"}
       }
     },
     "StartTaskResponse":{
@@ -1527,7 +1533,10 @@
         "status":{"shape":"String"},
         "reason":{"shape":"String"},
         "containers":{"shape":"ContainerStateChanges"},
-        "attachments":{"shape":"AttachmentStateChanges"}
+        "attachments":{"shape":"AttachmentStateChanges"},
+        "pullStartedAt":{"shape":"Timestamp"},
+        "pullStoppedAt":{"shape":"Timestamp"},
+        "executionStoppedAt":{"shape":"Timestamp"}
       }
     },
     "SubmitTaskStateChangeResponse":{
@@ -1564,7 +1573,6 @@
         "startedAt":{"shape":"Timestamp"},
         "stoppedAt":{"shape":"Timestamp"},
         "group":{"shape":"String"},
-        "platformVersion":{"shape":"String"},
         "attachments":{"shape":"Attachments"}
       }
     },
@@ -1575,6 +1583,7 @@
         "containerDefinitions":{"shape":"ContainerDefinitions"},
         "family":{"shape":"String"},
         "taskRoleArn":{"shape":"String"},
+        "executionRoleArn":{"shape":"String"},
         "networkMode":{"shape":"NetworkMode"},
         "revision":{"shape":"Integer"},
         "volumes":{"shape":"VolumeList"},
@@ -1619,7 +1628,8 @@
       "type":"structure",
       "members":{
         "containerOverrides":{"shape":"ContainerOverrides"},
-        "taskRoleArn":{"shape":"String"}
+        "taskRoleArn":{"shape":"String"},
+        "executionRoleArn":{"shape":"String"}
       }
     },
     "Tasks":{

@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/fsouza/go-dockerclient"
 	"github.com/stretchr/testify/assert"
 )
@@ -98,7 +99,8 @@ func TestPostUnmarshalWindowsCanonicalPaths(t *testing.T) {
 	seqNum := int64(42)
 	task, err := TaskFromACS(&taskFromAcs, &ecsacs.PayloadMessage{SeqNum: &seqNum})
 	assert.Nil(t, err, "Should be able to handle acs task")
-	task.PostUnmarshalTask(nil, nil)
+	cfg := config.Config{TaskCPUMemLimit: config.ExplicitlyDisabled}
+	task.PostUnmarshalTask(&cfg, nil)
 
 	assert.Equal(t, expectedTask.Containers, task.Containers, "Containers should be equal")
 	assert.Equal(t, expectedTask.Volumes, task.Volumes, "Volumes should be equal")
@@ -110,11 +112,17 @@ func TestWindowsPlatformHostConfigOverride(t *testing.T) {
 
 	task := &Task{}
 
-	hostConfig := &docker.HostConfig{}
+	hostConfig := &docker.HostConfig{CPUShares: int64(1 * cpuSharesPerCore)}
 
 	task.platformHostConfigOverride(hostConfig)
-
+	assert.Equal(t, int64(1*cpuSharesPerCore*percentageFactor)/int64(cpuShareScaleFactor), hostConfig.CPUPercent)
+	assert.Equal(t, int64(0), hostConfig.CPUShares)
 	assert.EqualValues(t, expectedMemorySwappinessDefault, hostConfig.MemorySwappiness)
+
+	hostConfig = &docker.HostConfig{CPUShares: 10}
+	task.platformHostConfigOverride(hostConfig)
+	assert.Equal(t, int64(minimumCPUPercent), hostConfig.CPUPercent)
+	assert.Empty(t, hostConfig.CPUShares)
 }
 
 func TestWindowsMemorySwappinessOption(t *testing.T) {
@@ -140,7 +148,7 @@ func TestWindowsMemorySwappinessOption(t *testing.T) {
 		},
 	}
 
-	config, configErr := testTask.DockerHostConfig(testTask.Containers[0], dockerMap(testTask))
+	config, configErr := testTask.DockerHostConfig(testTask.Containers[0], dockerMap(testTask), defaultDockerClientAPIVersion)
 	if configErr != nil {
 		t.Fatal(configErr)
 	}

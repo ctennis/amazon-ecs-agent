@@ -315,10 +315,13 @@ func (client *APIECSClient) SubmitTaskStateChange(change api.TaskStateChange) er
 	status := change.Status.BackendStatus()
 
 	req := ecs.SubmitTaskStateChangeInput{
-		Cluster: aws.String(client.config.Cluster),
-		Task:    aws.String(change.TaskARN),
-		Status:  aws.String(status),
-		Reason:  aws.String(change.Reason),
+		Cluster:            aws.String(client.config.Cluster),
+		Task:               aws.String(change.TaskARN),
+		Status:             aws.String(status),
+		Reason:             aws.String(change.Reason),
+		PullStartedAt:      change.PullStartedAt,
+		PullStoppedAt:      change.PullStoppedAt,
+		ExecutionStoppedAt: change.ExecutionStoppedAt,
 	}
 
 	containerEvents := make([]*ecs.ContainerStateChange, len(change.Containers))

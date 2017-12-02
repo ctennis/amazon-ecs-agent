@@ -26,10 +26,12 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
+	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
 	"github.com/aws/amazon-ecs-agent/agent/vault"
 	awscredentials "github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/private/protocol/json/jsonutil"
 	"github.com/cihub/seelog"
 	"github.com/fsouza/go-dockerclient"
@@ -46,11 +48,18 @@ const (
 	// variable containers' config, which will be used by the AWS SDK to fetch
 	// credentials.
 	awsSDKCredentialsRelativeURIPathEnvironmentVariableName = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+
+	arnResourceSections  = 2
+	arnResourceDelimiter = "/"
 	// networkModeNone specifies the string used to define the `none` docker networking mode
 	networkModeNone = "none"
 	// networkModeContainerPrefix specifies the prefix string used for setting the
 	// container's network mode to be mapped to that of another existing container
 	networkModeContainerPrefix = "container:"
+
+	// awslogsCredsEndpointOpt is the awslogs option that is used to pass in an
+	// http endpoint for authentication
+	awslogsCredsEndpointOpt = "awslogs-credentials-endpoint"
 )
 
 // TaskOverrides are the overrides applied to a task
@@ -70,7 +79,11 @@ type Task struct {
 	Containers []*Container
 	// Volumes are the volumes for the task
 	Volumes []TaskVolume `json:"volumes"`
-
+	// CPU is a task-level limit for compute resources. A value of 1 means that
+	// the task may access 100% of 1 vCPU on the instance
+	CPU float64 `json:"Cpu,omitempty"`
+	// Memory is a task-level limit for memory resources in bytes
+	Memory int64 `json:"Memory,omitempty"`
 	// DesiredStatusUnsafe represents the state where the task should go. Generally,
 	// the desired status is informed by the ECS backend as a result of either
 	// API calls made to ECS or decisions made by the ECS service scheduler.
@@ -81,7 +94,6 @@ type Task struct {
 	// setter/getter.  When this is done, we need to ensure that the UnmarshalJSON
 	// is handled properly so that the state storage continues to work.
 	DesiredStatusUnsafe TaskStatus `json:"DesiredStatus"`
-	desiredStatusLock   sync.RWMutex
 
 	// KnownStatusUnsafe represents the state where the task is.  This is generally
 	// the minimum of equivalent status types for the containers in the task;
@@ -93,11 +105,19 @@ type Task struct {
 	// setter/getter.  When this is done, we need to ensure that the UnmarshalJSON
 	// is handled properly so that the state storage continues to work.
 	KnownStatusUnsafe TaskStatus `json:"KnownStatus"`
-	knownStatusLock   sync.RWMutex
 	// KnownStatusTimeUnsafe captures the time when the KnownStatusUnsafe was last updated.
 	// NOTE: Do not access KnownStatusTime directly, instead use `GetKnownStatusTime`.
 	KnownStatusTimeUnsafe time.Time `json:"KnownTime"`
-	knownStatusTimeLock   sync.RWMutex
+
+	// PullStartedAt is the timestamp when the task start pulling the first container,
+	// it won't be set if the pull never happens
+	PullStartedAt time.Time `json:"PullStartedAt"`
+	// PullStoppedAt is the timestamp when the task finished pulling the last container,
+	// it won't be set if the pull never happens
+	PullStoppedAt time.Time `json:"PullStoppedAt"`
+	// ExecutionStoppedAt is the timestamp when the task desired status moved to stopped,
+	// which is when the any of the essential containers stopped
+	ExecutionStoppedAt time.Time `json:"ExecutionStoppedAt"`
 
 	// SentStatusUnsafe represents the last KnownStatusUnsafe that was sent to the ECS SubmitTaskStateChange API.
 	// TODO(samuelkarp) SentStatusUnsafe needs a lock and setters/getters.
@@ -105,20 +125,28 @@ type Task struct {
 	// setter/getter.  When this is done, we need to ensure that the UnmarshalJSON
 	// is handled properly so that the state storage continues to work.
 	SentStatusUnsafe TaskStatus `json:"SentStatus"`
-	sentStatusLock   sync.RWMutex
 
 	StartSequenceNumber int64
 	StopSequenceNumber  int64
 
+	// ExecutionCredentialsID is the ID of credentials that are used by agent to
+	// perform some action at the task level, such as pulling image from ECR
+	ExecutionCredentialsID string `json:"executionCredentialsID"`
+
 	// credentialsID is used to set the CredentialsId field for the
 	// IAMRoleCredentials object associated with the task. This id can be
 	// used to look up the credentials for task in the credentials manager
-	credentialsID     string
-	credentialsIDLock sync.RWMutex
+	credentialsID string
 
 	// ENI is the elastic network interface specified by this task
-	ENI     *ENI
-	eniLock sync.RWMutex
+	ENI *ENI
+
+	// lock is for protecting all fields in the task struct
+	lock sync.RWMutex
+
+	// MemoryCPULimitsEnabled to determine if task supports CPU, memory limits
+	MemoryCPULimitsEnabled     bool `json:"MemoryCPULimitsEnabled,omitempty"`
+	memoryCPULimitsEnabledLock sync.RWMutex
 }
 
 // PostUnmarshalTask is run after a task has been unmarshalled, but before it has been
@@ -127,7 +155,7 @@ type Task struct {
 func (task *Task) PostUnmarshalTask(cfg *config.Config, credentialsManager credentials.Manager) {
 	// TODO, add rudimentary plugin support and call any plugins that want to
 	// hook into this
-	task.adjustForPlatform()
+	task.adjustForPlatform(cfg)
 	task.initializeEmptyVolumes()
 	task.initializeCredentialsEndpoint(credentialsManager)
 	task.addNetworkResourceProvisioningDependency(cfg)
@@ -402,11 +430,11 @@ func (task *Task) getEarliestKnownTaskStatusForContainers() TaskStatus {
 
 // DockerConfig converts the given container in this task to the format of
 // GoDockerClient's 'Config' struct
-func (task *Task) DockerConfig(container *Container) (*docker.Config, *DockerClientConfigError) {
-	return task.dockerConfig(container)
+func (task *Task) DockerConfig(container *Container, apiVersion dockerclient.DockerVersion) (*docker.Config, *DockerClientConfigError) {
+	return task.dockerConfig(container, apiVersion)
 }
 
-func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerClientConfigError) {
+func (task *Task) dockerConfig(container *Container, apiVersion dockerclient.DockerVersion) (*docker.Config, *DockerClientConfigError) {
 	dockerVolumes, err := task.dockerConfigVolumes(container)
 	if err != nil {
 		return nil, &DockerClientConfigError{err.Error()}
@@ -435,8 +463,11 @@ func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerCli
 		ExposedPorts: task.dockerExposedPorts(container),
 		Volumes:      dockerVolumes,
 		Env:          dockerEnv,
-		Memory:       dockerMem,
-		CPUShares:    task.dockerCPUShares(container.CPU),
+	}
+
+	err = task.SetConfigHostconfigBasedOnVersion(container, config, nil, apiVersion)
+	if err != nil {
+		return nil, &DockerClientConfigError{"setting docker config failed, err: " + err.Error()}
 	}
 
 	if container.DockerConfig.Config != nil {
@@ -450,6 +481,43 @@ func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerCli
 	}
 
 	return config, nil
+}
+
+// SetConfigHostconfigBasedOnVersion sets the fields in both Config and HostConfig based on api version for backward compatibility
+func (task *Task) SetConfigHostconfigBasedOnVersion(container *Container, config *docker.Config, hc *docker.HostConfig, apiVersion dockerclient.DockerVersion) error {
+	// Convert MB to B
+	dockerMem := int64(container.Memory * 1024 * 1024)
+	if dockerMem != 0 && dockerMem < DockerContainerMinimumMemoryInBytes {
+		seelog.Warnf("Task %s container %s memory setting is too low, increasing to %d bytes", task.Arn, container.Name, DockerContainerMinimumMemoryInBytes)
+		dockerMem = DockerContainerMinimumMemoryInBytes
+	}
+	cpuShare := task.dockerCPUShares(container.CPU)
+
+	// Docker copied Memory and cpu field into hostconfig in 1.6 with api version(1.18)
+	// https://github.com/moby/moby/commit/837eec064d2d40a4d86acbc6f47fada8263e0d4c
+	dockerAPIVersion, err := docker.NewAPIVersion(string(apiVersion))
+	if err != nil {
+		seelog.Errorf("Creating docker api version failed, err: %v", err)
+		return err
+	}
+
+	dockerAPIVersion_1_18 := docker.APIVersion([]int{1, 18})
+	if dockerAPIVersion.GreaterThanOrEqualTo(dockerAPIVersion_1_18) {
+		// Set the memory and cpu in host config
+		if hc != nil {
+			hc.Memory = dockerMem
+			hc.CPUShares = cpuShare
+		}
+		return nil
+	}
+
+	// Set the memory and cpu in config
+	if config != nil {
+		config.Memory = dockerMem
+		config.CPUShares = cpuShare
+	}
+
+	return nil
 }
 
 // dockerCPUShares converts containerCPU shares if needed as per the logic stated below:
@@ -499,11 +567,34 @@ func (task *Task) dockerConfigVolumes(container *Container) (map[string]struct{}
 	return volumeMap, nil
 }
 
-func (task *Task) DockerHostConfig(container *Container, dockerContainerMap map[string]*DockerContainer) (*docker.HostConfig, *HostConfigError) {
-	return task.dockerHostConfig(container, dockerContainerMap)
+// DockerHostConfig construct the configuration recognized by docker
+func (task *Task) DockerHostConfig(container *Container, dockerContainerMap map[string]*DockerContainer, apiVersion dockerclient.DockerVersion) (*docker.HostConfig, *HostConfigError) {
+	return task.dockerHostConfig(container, dockerContainerMap, apiVersion)
 }
 
-func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[string]*DockerContainer) (*docker.HostConfig, *HostConfigError) {
+// ApplyExecutionRoleLogsAuth will check whether the task has excecution role
+// credentials, and add the genereated credentials endpoint to the associated HostConfig
+func (task *Task) ApplyExecutionRoleLogsAuth(hostConfig *docker.HostConfig, credentialsManager credentials.Manager) *HostConfigError {
+	id := task.GetExecutionCredentialsID()
+	if id == "" {
+		// No execution credentials set for the task. Do not inject the endpoint environment variable.
+		return &HostConfigError{"No execution credentials set for the task"}
+	}
+
+	executionRoleCredentials, ok := credentialsManager.GetTaskCredentials(id)
+	if !ok {
+		// Task has credentials id set, but credentials manager is unaware of
+		// the id. This should never happen as the payload handler sets
+		// credentialsId for the task after adding credentials to the
+		// credentials manager
+		return &HostConfigError{"Unable to get execution role credentials for task"}
+	}
+	credentialsEndpointRelativeURI := executionRoleCredentials.IAMRoleCredentials.GenerateCredentialsEndpointRelativeURI()
+	hostConfig.LogConfig.Config[awslogsCredsEndpointOpt] = credentialsEndpointRelativeURI
+	return nil
+}
+
+func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[string]*DockerContainer, apiVersion dockerclient.DockerVersion) (*docker.HostConfig, *HostConfigError) {
 	dockerLinkArr, err := task.dockerLinks(container, dockerContainerMap)
 	if err != nil {
 		return nil, &HostConfigError{err.Error()}
@@ -521,11 +612,17 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
 		return nil, &HostConfigError{err.Error()}
 	}
 
+	// Populate hostConfig
 	hostConfig := &docker.HostConfig{
 		Links:        dockerLinkArr,
 		Binds:        binds,
 		PortBindings: dockerPortMap,
 		VolumesFrom:  volumesFrom,
+	}
+
+	err = task.SetConfigHostconfigBasedOnVersion(container, nil, hostConfig, apiVersion)
+	if err != nil {
+		return nil, &HostConfigError{err.Error()}
 	}
 
 	if container.DockerConfig.HostConfig != nil {
@@ -535,7 +632,10 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
 		}
 	}
 
-	task.platformHostConfigOverride(hostConfig)
+	err = task.platformHostConfigOverride(hostConfig)
+	if err != nil {
+		return nil, &HostConfigError{err.Error()}
+	}
 
 	// Determine if network mode should be overridden and override it if needed
 	ok, networkMode := task.shouldOverrideNetworkMode(container, dockerContainerMap)
@@ -716,7 +816,6 @@ func TaskFromACS(acsTask *ecsacs.Task, envelope *ecsacs.PayloadMessage) (*Task, 
 	if err != nil {
 		return nil, err
 	}
-
 	if task.GetDesiredStatus() == TaskRunning && envelope.SeqNum != nil {
 		task.StartSequenceNumber = *envelope.SeqNum
 	} else if task.GetDesiredStatus() == TaskStopped && envelope.SeqNum != nil {
@@ -786,112 +885,228 @@ func (task *Task) SetKnownStatus(status TaskStatus) {
 }
 
 func (task *Task) setKnownStatus(status TaskStatus) {
-	task.knownStatusLock.Lock()
-	defer task.knownStatusLock.Unlock()
+	task.lock.Lock()
+	defer task.lock.Unlock()
 
 	task.KnownStatusUnsafe = status
 }
 
 func (task *Task) updateKnownStatusTime() {
-	task.knownStatusTimeLock.Lock()
-	defer task.knownStatusTimeLock.Unlock()
+	task.lock.Lock()
+	defer task.lock.Unlock()
 
 	task.KnownStatusTimeUnsafe = ttime.Now()
 }
 
 // GetKnownStatus gets the KnownStatus of the task
 func (task *Task) GetKnownStatus() TaskStatus {
-	task.knownStatusLock.RLock()
-	defer task.knownStatusLock.RUnlock()
+	task.lock.RLock()
+	defer task.lock.RUnlock()
 
 	return task.KnownStatusUnsafe
 }
 
 // GetKnownStatusTime gets the KnownStatusTime of the task
 func (task *Task) GetKnownStatusTime() time.Time {
-	task.knownStatusTimeLock.RLock()
-	defer task.knownStatusTimeLock.RUnlock()
+	task.lock.RLock()
+	defer task.lock.RUnlock()
 
 	return task.KnownStatusTimeUnsafe
 }
 
 // SetCredentialsID sets the credentials ID for the task
 func (task *Task) SetCredentialsID(id string) {
-	task.credentialsIDLock.Lock()
-	defer task.credentialsIDLock.Unlock()
+	task.lock.Lock()
+	defer task.lock.Unlock()
 
 	task.credentialsID = id
 }
 
 // GetCredentialsID gets the credentials ID for the task
 func (task *Task) GetCredentialsID() string {
-	task.credentialsIDLock.RLock()
-	defer task.credentialsIDLock.RUnlock()
+	task.lock.RLock()
+	defer task.lock.RUnlock()
 
 	return task.credentialsID
 }
 
+// SetExecutionRoleCredentialsID sets the ID for the task execution role credentials
+func (task *Task) SetExecutionRoleCredentialsID(id string) {
+	task.lock.Lock()
+	defer task.lock.Unlock()
+
+	task.ExecutionCredentialsID = id
+}
+
+// GetExecutionCredentialsID gets the credentials ID for the task
+func (task *Task) GetExecutionCredentialsID() string {
+	task.lock.RLock()
+	defer task.lock.RUnlock()
+
+	return task.ExecutionCredentialsID
+}
+
 // GetDesiredStatus gets the desired status of the task
 func (task *Task) GetDesiredStatus() TaskStatus {
-	task.desiredStatusLock.RLock()
-	defer task.desiredStatusLock.RUnlock()
+	task.lock.RLock()
+	defer task.lock.RUnlock()
 
 	return task.DesiredStatusUnsafe
 }
 
 // SetDesiredStatus sets the desired status of the task
 func (task *Task) SetDesiredStatus(status TaskStatus) {
-	task.desiredStatusLock.Lock()
-	defer task.desiredStatusLock.Unlock()
+	task.lock.Lock()
+	defer task.lock.Unlock()
 
 	task.DesiredStatusUnsafe = status
 }
 
 // GetSentStatus safely returns the SentStatus of the task
 func (task *Task) GetSentStatus() TaskStatus {
-	task.sentStatusLock.RLock()
-	defer task.sentStatusLock.RUnlock()
+	task.lock.RLock()
+	defer task.lock.RUnlock()
 
 	return task.SentStatusUnsafe
 }
 
 // SetSentStatus safely sets the SentStatus of the task
 func (task *Task) SetSentStatus(status TaskStatus) {
-	task.sentStatusLock.Lock()
-	defer task.sentStatusLock.Unlock()
+	task.lock.Lock()
+	defer task.lock.Unlock()
 
 	task.SentStatusUnsafe = status
 }
 
 // SetTaskENI sets the eni information of the task
 func (task *Task) SetTaskENI(eni *ENI) {
-	task.eniLock.Lock()
-	defer task.eniLock.Unlock()
+	task.lock.Lock()
+	defer task.lock.Unlock()
 
 	task.ENI = eni
 }
 
 // GetTaskENI returns the eni of task, for now task can only have one enis
 func (task *Task) GetTaskENI() *ENI {
-	task.eniLock.RLock()
-	defer task.eniLock.RUnlock()
+	task.lock.RLock()
+	defer task.lock.RUnlock()
 
 	return task.ENI
 }
 
+// GetStopSequenceNumber returns the stop sequence number of a task
+func (task *Task) GetStopSequenceNumber() int64 {
+	task.lock.RLock()
+	defer task.lock.RUnlock()
+
+	return task.StopSequenceNumber
+}
+
+// SetStopSequenceNumber sets the stop seqence number of a task
+func (task *Task) SetStopSequenceNumber(seqnum int64) {
+	task.lock.Lock()
+	defer task.lock.Unlock()
+
+	task.StopSequenceNumber = seqnum
+}
+
+// SetPullStartedAt sets the task pullstartedat timestamp and returns whether
+// this field was updated or not
+func (task *Task) SetPullStartedAt(timestamp time.Time) bool {
+	task.lock.Lock()
+	defer task.lock.Unlock()
+
+	// Only set this field if it is not set
+	if task.PullStartedAt.IsZero() {
+		task.PullStartedAt = timestamp
+		return true
+	}
+	return false
+}
+
+// GetPullStartedAt returns the PullStartedAt timestamp
+func (task *Task) GetPullStartedAt() time.Time {
+	task.lock.RLock()
+	defer task.lock.RUnlock()
+
+	return task.PullStartedAt
+}
+
+// SetPullStoppedAt sets the task pullstoppedat timestamp
+func (task *Task) SetPullStoppedAt(timestamp time.Time) {
+	task.lock.Lock()
+	defer task.lock.Unlock()
+
+	task.PullStoppedAt = timestamp
+}
+
+// GetPullStoppedAt returns the PullStoppedAt timestamp
+func (task *Task) GetPullStoppedAt() time.Time {
+	task.lock.RLock()
+	defer task.lock.RUnlock()
+
+	return task.PullStoppedAt
+}
+
+// SetExecutionStoppedAt sets the ExecutionStoppedAt timestamp of the task
+func (task *Task) SetExecutionStoppedAt(timestamp time.Time) bool {
+	task.lock.Lock()
+	defer task.lock.Unlock()
+
+	if task.ExecutionStoppedAt.IsZero() {
+		task.ExecutionStoppedAt = timestamp
+		return true
+	}
+	return false
+}
+
+// GetExecutionStoppedAt returns the task executionStoppedAt timestamp
+func (task *Task) GetExecutionStoppedAt() time.Time {
+	task.lock.RLock()
+	defer task.lock.RUnlock()
+
+	return task.ExecutionStoppedAt
+}
+
 // String returns a human readable string representation of this object
 func (task *Task) String() string {
+	task.lock.Lock()
+	defer task.lock.Unlock()
+
 	res := fmt.Sprintf("%s:%s %s, TaskStatus: (%s->%s)",
 		task.Family, task.Version, task.Arn,
-		task.GetKnownStatus().String(), task.GetDesiredStatus().String())
+		task.KnownStatusUnsafe.String(), task.DesiredStatusUnsafe.String())
 	res += " Containers: ["
 	for _, c := range task.Containers {
 		res += fmt.Sprintf("%s (%s->%s),", c.Name, c.GetKnownStatus().String(), c.GetDesiredStatus().String())
 	}
-	task.eniLock.Lock()
-	defer task.eniLock.Unlock()
+
 	if task.ENI != nil {
 		res += fmt.Sprintf(" ENI: [%s]", task.ENI.String())
 	}
 	return res + "]"
+}
+
+// GetID is used to retrieve the taskID from taskARN
+// Reference: http://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html#arn-syntax-ecs
+func (task *Task) GetID() (string, error) {
+	// Parse taskARN
+	parsedARN, err := arn.Parse(task.Arn)
+	if err != nil {
+		return "", errors.Wrapf(err, "task get-id: malformed taskARN: %s", task.Arn)
+	}
+
+	// Get task resource section
+	resource := parsedARN.Resource
+
+	if !strings.Contains(resource, arnResourceDelimiter) {
+		return "", errors.New(fmt.Sprintf("task get-id: malformed task resource: %s", resource))
+	}
+
+	resourceSplit := strings.SplitN(resource, arnResourceDelimiter, arnResourceSections)
+	if len(resourceSplit) != arnResourceSections {
+		return "", errors.New(fmt.Sprintf("task get-id: invalid task resource split: %s, expected=%d, actual=%d", resource, arnResourceSections, len(resourceSplit)))
+	}
+
+	return resourceSplit[1], nil
 }

@@ -33,6 +33,30 @@ func TestLRUSimple(t *testing.T) {
 	baz, ok := lru.Get("fooz")
 	assert.False(t, ok)
 	assert.Nil(t, baz)
+
+	lru.Delete("foo")
+	bar, ok = lru.Get("foo")
+	assert.False(t, ok)
+	assert.Nil(t, bar)
+}
+
+func TestLRUSetDelete(t *testing.T) {
+	lru := NewLRUCache(10, time.Minute)
+
+	lru.Set("foo", "bar")
+	bar, ok := lru.Get("foo")
+	assert.True(t, ok)
+	assert.Equal(t, bar, "bar")
+
+	lru.Set("foo", "bar2")
+	bar, ok = lru.Get("foo")
+	assert.True(t, ok)
+	assert.Equal(t, bar, "bar2")
+
+	lru.Delete("foo")
+	bar, ok = lru.Get("foo")
+	assert.False(t, ok)
+	assert.Nil(t, bar)
 }
 
 func TestLRUTTlPurge(t *testing.T) {
@@ -69,9 +93,9 @@ func TestLRUSizePurge(t *testing.T) {
 	assert.Nil(t, bar)
 }
 
-func TestLRUCacheConcurrency(t *testing.T) {
+func BenchmarkLRUCacheConcurrency(b *testing.B) {
 	// prime a cache with %80 size
-	size := 100000
+	size := 10000
 	lru := NewLRUCache(size/80, 30*time.Minute)
 	for i := 0; i < size; i++ {
 		lru.Set(fmt.Sprintf("%d", i), true)

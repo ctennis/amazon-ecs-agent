@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
+	"github.com/aws/amazon-ecs-agent/agent/async"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/ecr"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerauth"
@@ -63,6 +64,11 @@ const (
 	removeContainerTimeout  = 5 * time.Minute
 	inspectContainerTimeout = 30 * time.Second
 	removeImageTimeout      = 3 * time.Minute
+
+	// Parameters for caching the docker auth for ECR
+	tokenCacheSize = 100
+	// tokenCacheTTL is the default ttl of the docker auth for ECR
+	tokenCacheTTL = 12 * time.Hour
 
 	// dockerPullBeginTimeout is the timeout from when a 'pull' is called to when
 	// we expect to see output on the pull progress stream. This is to work
@@ -140,6 +146,8 @@ type DockerClient interface {
 
 	// Version returns the version of the Docker daemon.
 	Version() (string, error)
+	// APIVersion returns the api version of the client
+	APIVersion() (dockerclient.DockerVersion, error)
 
 	// InspectImage returns information about the specified image.
 	InspectImage(string) (*docker.Image, error)
@@ -168,8 +176,9 @@ type DockerClient interface {
 type dockerGoClient struct {
 	clientFactory    dockerclient.Factory
 	version          dockerclient.DockerVersion
-	auth             dockerauth.DockerAuthProvider
 	ecrClientFactory ecr.ECRFactory
+	auth             dockerauth.DockerAuthProvider
+	ecrTokenCache    async.Cache
 	config           *config.Config
 
 	_time     ttime.Time
@@ -213,6 +222,7 @@ func NewDockerGoClient(clientFactory dockerclient.Factory, cfg *config.Config) (
 		clientFactory:    clientFactory,
 		auth:             dockerauth.NewDockerAuthProvider(cfg.EngineAuthType, dockerAuthData),
 		ecrClientFactory: ecr.NewECRFactory(cfg.AcceptInsecureCert),
+		ecrTokenCache:    async.NewLRUCache(tokenCacheSize, tokenCacheTTL),
 		config:           cfg,
 	}, nil
 }
@@ -427,10 +437,10 @@ func (dg *dockerGoClient) InspectImage(image string) (*docker.Image, error) {
 
 func (dg *dockerGoClient) getAuthdata(image string, authData *api.RegistryAuthenticationData) (docker.AuthConfiguration, error) {
 	if authData == nil || authData.Type != "ecr" {
-		return dg.auth.GetAuthconfig(image)
+		return dg.auth.GetAuthconfig(image, nil)
 	}
-	provider := dockerauth.NewECRAuthProvider(authData.ECRAuthData, dg.ecrClientFactory)
-	authConfig, err := provider.GetAuthconfig(image)
+	provider := dockerauth.NewECRAuthProvider(dg.ecrClientFactory, dg.ecrTokenCache)
+	authConfig, err := provider.GetAuthconfig(image, authData.ECRAuthData)
 	if err != nil {
 		return authConfig, CannotPullECRContainerError{err}
 	}
@@ -874,6 +884,15 @@ func (dg *dockerGoClient) Version() (string, error) {
 		return "", err
 	}
 	return info.Get("Version"), nil
+}
+
+// APIVersion returns the client api version
+func (dg *dockerGoClient) APIVersion() (dockerclient.DockerVersion, error) {
+	client, err := dg.dockerClient()
+	if err != nil {
+		return "", err
+	}
+	return dg.clientFactory.FindClientAPIVersion(client), nil
 }
 
 // Stats returns a channel of *docker.Stats entries for the container.

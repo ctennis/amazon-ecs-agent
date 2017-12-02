@@ -20,10 +20,12 @@ import (
 )
 
 type Cache interface {
-	// fetch a value from cache, returns nil, false on miss
+	// Get fetches a value from cache, returns nil, false on miss
 	Get(key string) (Value, bool)
-	// sets a value in cache. overrites any existing value
+	// Set sets a value in cache. overrites any existing value
 	Set(key string, value Value)
+	// Delete deletes the value from the cache
+	Delete(key string)
 }
 
 // Creates an LRUCache with maximum size, ttl for items.
@@ -51,6 +53,7 @@ type lruCache struct {
 	ttl       time.Duration
 }
 
+// Get returns the value associated with the key
 func (lru *lruCache) Get(key string) (Value, bool) {
 	lru.Lock()
 	defer lru.Unlock()
@@ -71,13 +74,27 @@ func (lru *lruCache) Get(key string) (Value, bool) {
 	return entry.value, true
 }
 
+// Set sets the key-value pair in the cache
 func (lru *lruCache) Set(key string, value Value) {
 	lru.Lock()
 	defer lru.Unlock()
 
 	lru.cache[key] = &entry{value: value, added: time.Now()}
+
+	// Remove from the evict list if an entry already existed
+	lru.removeFromEvictList(key)
+
 	lru.evictList.PushBack(key)
 	lru.purgeSize()
+}
+
+// Delete removes the entry associated with the key from cache
+func (lru *lruCache) Delete(key string) {
+	lru.Lock()
+	defer lru.Unlock()
+
+	lru.removeFromEvictList(key)
+	delete(lru.cache, key)
 }
 
 func (lru *lruCache) updateAccessed(key string) {
@@ -88,6 +105,18 @@ func (lru *lruCache) updateAccessed(key string) {
 			break
 		}
 	}
+}
+
+func (lru *lruCache) removeFromEvictList(key string) {
+	var next *list.Element
+	for element := lru.evictList.Front(); element != nil; element = next {
+		next = element.Next()
+		if element.Value == key {
+			lru.evictList.Remove(element)
+			break
+		}
+	}
+
 }
 
 func (lru *lruCache) evictStale(entry *entry, key string) bool {

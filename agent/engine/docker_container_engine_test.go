@@ -32,6 +32,7 @@ import (
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/ecr/mocks"
 	ecrapi "github.com/aws/amazon-ecs-agent/agent/ecr/model/ecr"
@@ -53,11 +54,23 @@ func defaultTestConfig() *config.Config {
 	return cfg
 }
 
-func dockerClientSetup(t *testing.T) (*mock_dockeriface.MockClient, *dockerGoClient, *mock_ttime.MockTime, func()) {
+func dockerClientSetup(t *testing.T) (
+	*mock_dockeriface.MockClient,
+	*dockerGoClient,
+	*mock_ttime.MockTime,
+	*gomock.Controller,
+	*mock_ecr.MockECRFactory,
+	func()) {
 	return dockerClientSetupWithConfig(t, config.DefaultConfig())
 }
 
-func dockerClientSetupWithConfig(t *testing.T, conf config.Config) (*mock_dockeriface.MockClient, *dockerGoClient, *mock_ttime.MockTime, func()) {
+func dockerClientSetupWithConfig(t *testing.T, conf config.Config) (
+	*mock_dockeriface.MockClient,
+	*dockerGoClient,
+	*mock_ttime.MockTime,
+	*gomock.Controller,
+	*mock_ecr.MockECRFactory,
+	func()) {
 	ctrl := gomock.NewController(t)
 	mockDocker := mock_dockeriface.NewMockClient(ctrl)
 	mockDocker.EXPECT().Ping().AnyTimes().Return(nil)
@@ -71,7 +84,7 @@ func dockerClientSetupWithConfig(t *testing.T, conf config.Config) (*mock_docker
 	ecrClientFactory := mock_ecr.NewMockECRFactory(ctrl)
 	goClient.ecrClientFactory = ecrClientFactory
 	goClient._time = mockTime
-	return mockDocker, goClient, mockTime, ctrl.Finish
+	return mockDocker, goClient, mockTime, ctrl, ecrClientFactory, ctrl.Finish
 }
 
 type pullImageOptsMatcher struct {
@@ -87,7 +100,7 @@ func (matcher *pullImageOptsMatcher) Matches(x interface{}) bool {
 }
 
 func TestPullImageOutputTimeout(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
+	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	pullBeginTimeout := make(chan time.Time)
@@ -115,7 +128,7 @@ func TestPullImageOutputTimeout(t *testing.T) {
 }
 
 func TestPullImageGlobalTimeout(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
+	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	pullBeginTimeout := make(chan time.Time, 1)
@@ -154,7 +167,7 @@ func TestPullImageGlobalTimeout(t *testing.T) {
 }
 
 func TestPullImage(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
+	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	testTime.EXPECT().After(gomock.Any()).AnyTimes()
@@ -165,7 +178,7 @@ func TestPullImage(t *testing.T) {
 }
 
 func TestPullImageTag(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
+	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	testTime.EXPECT().After(gomock.Any()).AnyTimes()
@@ -176,7 +189,7 @@ func TestPullImageTag(t *testing.T) {
 }
 
 func TestPullImageDigest(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
+	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	testTime.EXPECT().After(gomock.Any()).AnyTimes()
@@ -227,7 +240,7 @@ func TestPullImageECRSuccess(t *testing.T) {
 		ServerAddress: "https://" + imageEndpoint,
 	}
 
-	ecrClientFactory.EXPECT().GetClient(region, endpointOverride).Return(ecrClient)
+	ecrClientFactory.EXPECT().GetClient(authData.ECRAuthData).Return(ecrClient, nil)
 	ecrClient.EXPECT().GetAuthorizationToken(registryID).Return(
 		&ecrapi.AuthorizationData{
 			ProxyEndpoint:      aws.String("https://" + imageEndpoint),
@@ -274,8 +287,8 @@ func TestPullImageECRAuthFail(t *testing.T) {
 	imageEndpoint := "registry.endpoint"
 	image := imageEndpoint + "/myimage:tag"
 
-	ecrClientFactory.EXPECT().GetClient(region, endpointOverride).Return(ecrClient)
 	// no retries for this error
+	ecrClientFactory.EXPECT().GetClient(authData.ECRAuthData).Return(ecrClient, nil)
 	ecrClient.EXPECT().GetAuthorizationToken(gomock.Any()).Return(nil, errors.New("test error"))
 
 	metadata := client.PullImage(image, authData)
@@ -283,7 +296,7 @@ func TestPullImageECRAuthFail(t *testing.T) {
 }
 
 func TestImportLocalEmptyVolumeImage(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
+	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	// The special emptyvolume image leads to a create, not pull
@@ -302,7 +315,7 @@ func TestImportLocalEmptyVolumeImage(t *testing.T) {
 }
 
 func TestImportLocalEmptyVolumeImageExisting(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
+	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	// The special emptyvolume image leads to a create only if it doesn't exist
@@ -316,7 +329,7 @@ func TestImportLocalEmptyVolumeImageExisting(t *testing.T) {
 }
 
 func TestCreateContainerTimeout(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	warp := make(chan time.Time)
@@ -335,7 +348,7 @@ func TestCreateContainerTimeout(t *testing.T) {
 }
 
 func TestCreateContainerInspectTimeout(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	wait := &sync.WaitGroup{}
@@ -363,7 +376,7 @@ func TestCreateContainerInspectTimeout(t *testing.T) {
 }
 
 func TestCreateContainer(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	config := docker.CreateContainerOptions{Config: &docker.Config{Memory: 100}, Name: "containerName"}
@@ -391,7 +404,7 @@ func TestCreateContainer(t *testing.T) {
 }
 
 func TestStartContainerTimeout(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	testDone := make(chan struct{})
@@ -411,7 +424,7 @@ func TestStartContainerTimeout(t *testing.T) {
 }
 
 func TestStartContainer(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	gomock.InOrder(
@@ -430,7 +443,7 @@ func TestStartContainer(t *testing.T) {
 func TestStopContainerTimeout(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.DockerStopTimeout = xContainerShortTimeout
-	mockDocker, client, _, done := dockerClientSetupWithConfig(t, cfg)
+	mockDocker, client, _, _, _, done := dockerClientSetupWithConfig(t, cfg)
 	defer done()
 
 	warp := make(chan time.Time)
@@ -452,7 +465,7 @@ func TestStopContainerTimeout(t *testing.T) {
 }
 
 func TestStopContainer(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	gomock.InOrder(
@@ -469,7 +482,7 @@ func TestStopContainer(t *testing.T) {
 }
 
 func TestInspectContainerTimeout(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	warp := make(chan time.Time)
@@ -491,7 +504,7 @@ func TestInspectContainerTimeout(t *testing.T) {
 }
 
 func TestInspectContainer(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	containerOutput := docker.Container{ID: "id", State: docker.State{ExitCode: 10}}
@@ -508,7 +521,7 @@ func TestInspectContainer(t *testing.T) {
 }
 
 func TestContainerEvents(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	var events chan<- *docker.APIEvents
@@ -647,7 +660,7 @@ func TestContainerEvents(t *testing.T) {
 }
 
 func TestDockerVersion(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	mockDocker.EXPECT().Version().Return(&docker.Env{"Version=1.6.0"}, nil)
@@ -662,7 +675,7 @@ func TestDockerVersion(t *testing.T) {
 }
 
 func TestListContainers(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	containers := []docker.APIContainers{{ID: "id"}}
@@ -683,7 +696,7 @@ func TestListContainers(t *testing.T) {
 }
 
 func TestListContainersTimeout(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	warp := make(chan time.Time)
@@ -770,7 +783,7 @@ func TestUnavailableVersionError(t *testing.T) {
 }
 
 func TestStatsNormalExit(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 	time1 := time.Now()
 	time2 := time1.Add(1 * time.Second)
@@ -812,7 +825,7 @@ func checkStatRead(t *testing.T, stat *docker.Stats, read time.Time) {
 }
 
 func TestStatsClosed(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 	time1 := time.Now()
 	mockDocker.EXPECT().Stats(gomock.Any()).Do(func(x interface{}) {
@@ -856,7 +869,7 @@ func TestStatsClosed(t *testing.T) {
 }
 
 func TestStatsErrorReading(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 	mockDocker.EXPECT().Stats(gomock.Any()).Do(func(x interface{}) error {
 		opts := x.(docker.StatsOptions)
@@ -890,7 +903,9 @@ func TestStatsClientError(t *testing.T) {
 }
 
 func TestRemoveImageTimeout(t *testing.T) {
-	mockDocker, client, _, _ := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
+	defer done()
+
 	wait := sync.WaitGroup{}
 	wait.Add(1)
 	mockDocker.EXPECT().RemoveImage("image").Do(func(x interface{}) {
@@ -904,7 +919,7 @@ func TestRemoveImageTimeout(t *testing.T) {
 }
 
 func TestRemoveImage(t *testing.T) {
-	mockDocker, client, testTime, done := dockerClientSetup(t)
+	mockDocker, client, testTime, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	testTime.EXPECT().After(gomock.Any()).AnyTimes()
@@ -916,7 +931,9 @@ func TestRemoveImage(t *testing.T) {
 }
 
 func TestContainerMetadataWorkaroundIssue27601(t *testing.T) {
-	mockDocker, client, _, _ := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
+	defer done()
+
 	mockDocker.EXPECT().InspectContainerWithContext("id", gomock.Any()).Return(&docker.Container{
 		Mounts: []docker.Mount{{
 			Destination: "destination1",
@@ -931,7 +948,7 @@ func TestContainerMetadataWorkaroundIssue27601(t *testing.T) {
 }
 
 func TestLoadImageHappyPath(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	mockDocker.EXPECT().LoadImage(gomock.Any()).Return(nil)
@@ -941,7 +958,7 @@ func TestLoadImageHappyPath(t *testing.T) {
 }
 
 func TestLoadImageTimeoutError(t *testing.T) {
-	mockDocker, client, _, done := dockerClientSetup(t)
+	mockDocker, client, _, _, _, done := dockerClientSetup(t)
 	defer done()
 
 	wait := sync.WaitGroup{}
@@ -955,4 +972,212 @@ func TestLoadImageTimeoutError(t *testing.T) {
 	_, ok := err.(*DockerTimeoutError)
 	assert.True(t, ok)
 	wait.Done()
+}
+
+// TestECRAuthCache tests the client will use cached docker auth if pulling
+// from same registry on ecr with default instance profile
+func TestECRAuthCacheWithoutExecutionRole(t *testing.T) {
+	mockDocker, client, mockTime, ctrl, ecrClientFactory, done := dockerClientSetup(t)
+	defer done()
+
+	mockTime.EXPECT().After(gomock.Any()).AnyTimes()
+	ecrClient := mock_ecr.NewMockECRClient(ctrl)
+
+	region := "eu-west-1"
+	registryID := "1234567890"
+	endpointOverride := "my.endpoint"
+	imageEndpoint := "registry.endpoint"
+	image := imageEndpoint + "myimage:tag"
+	authData := &api.RegistryAuthenticationData{
+		Type: "ecr",
+		ECRAuthData: &api.ECRAuthData{
+			RegistryID:       registryID,
+			Region:           region,
+			EndpointOverride: endpointOverride,
+		},
+	}
+
+	username := "username"
+	password := "password"
+
+	ecrClientFactory.EXPECT().GetClient(authData.ECRAuthData).Return(ecrClient, nil).Times(1)
+	ecrClient.EXPECT().GetAuthorizationToken(registryID).Return(
+		&ecrapi.AuthorizationData{
+			ProxyEndpoint:      aws.String("https://" + imageEndpoint),
+			AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
+			ExpiresAt:          aws.Time(time.Now().Add(10 * time.Hour)),
+		}, nil).Times(1)
+	mockDocker.EXPECT().PullImage(gomock.Any(), gomock.Any()).Return(nil).Times(4)
+
+	metadata := client.PullImage(image, authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+
+	// Pull from the same registry shouldn't expect ecr client call
+	metadata = client.PullImage(image+"2", authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+
+	// Pull from the same registry shouldn't expect ecr client call
+	metadata = client.PullImage(image+"3", authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+
+	// Pull from the same registry shouldn't expect ecr client call
+	metadata = client.PullImage(image+"4", authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+}
+
+// TestECRAuthCacheForDifferentRegistry tests the client will call ecr client to get docker
+// auth for different registry
+func TestECRAuthCacheForDifferentRegistry(t *testing.T) {
+	mockDocker, client, mockTime, ctrl, ecrClientFactory, done := dockerClientSetup(t)
+	defer done()
+
+	mockTime.EXPECT().After(gomock.Any()).AnyTimes()
+	ecrClient := mock_ecr.NewMockECRClient(ctrl)
+
+	region := "eu-west-1"
+	registryID := "1234567890"
+	endpointOverride := "my.endpoint"
+	imageEndpoint := "registry.endpoint"
+	image := imageEndpoint + "/myimage:tag"
+	authData := &api.RegistryAuthenticationData{
+		Type: "ecr",
+		ECRAuthData: &api.ECRAuthData{
+			RegistryID:       registryID,
+			Region:           region,
+			EndpointOverride: endpointOverride,
+		},
+	}
+
+	username := "username"
+	password := "password"
+
+	ecrClientFactory.EXPECT().GetClient(authData.ECRAuthData).Return(ecrClient, nil).Times(1)
+	ecrClient.EXPECT().GetAuthorizationToken(registryID).Return(
+		&ecrapi.AuthorizationData{
+			ProxyEndpoint:      aws.String("https://" + imageEndpoint),
+			AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
+			ExpiresAt:          aws.Time(time.Now().Add(10 * time.Hour)),
+		}, nil).Times(1)
+	mockDocker.EXPECT().PullImage(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+
+	metadata := client.PullImage(image, authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+
+	// Pull from the different registry should expect ECR client call
+	authData.ECRAuthData.RegistryID = "another"
+	ecrClientFactory.EXPECT().GetClient(authData.ECRAuthData).Return(ecrClient, nil).Times(1)
+	ecrClient.EXPECT().GetAuthorizationToken("another").Return(
+		&ecrapi.AuthorizationData{
+			ProxyEndpoint:      aws.String("https://" + imageEndpoint),
+			AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
+			ExpiresAt:          aws.Time(time.Now().Add(10 * time.Hour)),
+		}, nil).Times(1)
+	metadata = client.PullImage(image, authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+}
+
+// TestECRAuthCacheWithExecutionRole tests the client will use the cached docker auth
+// for ecr when pull from the same registery with same execution role
+func TestECRAuthCacheWithSameExecutionRole(t *testing.T) {
+	mockDocker, client, mockTime, ctrl, ecrClientFactory, done := dockerClientSetup(t)
+	defer done()
+
+	mockTime.EXPECT().After(gomock.Any()).AnyTimes()
+	ecrClient := mock_ecr.NewMockECRClient(ctrl)
+
+	region := "eu-west-1"
+	registryID := "1234567890"
+	imageEndpoint := "registry.endpoint"
+	image := imageEndpoint + "/myimage:tag"
+	endpointOverride := "my.endpoint"
+	authData := &api.RegistryAuthenticationData{
+		Type: "ecr",
+		ECRAuthData: &api.ECRAuthData{
+			RegistryID:       registryID,
+			Region:           region,
+			EndpointOverride: endpointOverride,
+		},
+	}
+	authData.ECRAuthData.SetPullCredentials(credentials.IAMRoleCredentials{
+		RoleArn: "executionRole",
+	})
+
+	username := "username"
+	password := "password"
+
+	ecrClientFactory.EXPECT().GetClient(authData.ECRAuthData).Return(ecrClient, nil).Times(1)
+	ecrClient.EXPECT().GetAuthorizationToken(registryID).Return(
+		&ecrapi.AuthorizationData{
+			ProxyEndpoint:      aws.String("https://" + imageEndpoint),
+			AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
+			ExpiresAt:          aws.Time(time.Now().Add(10 * time.Hour)),
+		}, nil).Times(1)
+	mockDocker.EXPECT().PullImage(gomock.Any(), gomock.Any()).Return(nil).Times(3)
+
+	metadata := client.PullImage(image, authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+
+	// Pull from the same registry shouldn't expect ecr client call
+	metadata = client.PullImage(image+"2", authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+
+	// Pull from the same registry shouldn't expect ecr client call
+	metadata = client.PullImage(image+"3", authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+}
+
+// TestECRAuthCacheWithDifferentExecutionRole tests client will call ecr client to get
+// docker auth credentails for different execution role
+func TestECRAuthCacheWithDifferentExecutionRole(t *testing.T) {
+	mockDocker, client, mockTime, ctrl, ecrClientFactory, done := dockerClientSetup(t)
+	defer done()
+
+	mockTime.EXPECT().After(gomock.Any()).AnyTimes()
+	ecrClient := mock_ecr.NewMockECRClient(ctrl)
+
+	region := "eu-west-1"
+	registryID := "1234567890"
+	imageEndpoint := "registry.endpoint"
+	image := imageEndpoint + "/myimage:tag"
+	endpointOverride := "my.endpoint"
+	authData := &api.RegistryAuthenticationData{
+		Type: "ecr",
+		ECRAuthData: &api.ECRAuthData{
+			RegistryID:       registryID,
+			Region:           region,
+			EndpointOverride: endpointOverride,
+		},
+	}
+	authData.ECRAuthData.SetPullCredentials(credentials.IAMRoleCredentials{
+		RoleArn: "executionRole",
+	})
+
+	username := "username"
+	password := "password"
+
+	ecrClientFactory.EXPECT().GetClient(authData.ECRAuthData).Return(ecrClient, nil).Times(1)
+	ecrClient.EXPECT().GetAuthorizationToken(registryID).Return(
+		&ecrapi.AuthorizationData{
+			ProxyEndpoint:      aws.String("https://" + imageEndpoint),
+			AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
+			ExpiresAt:          aws.Time(time.Now().Add(10 * time.Hour)),
+		}, nil).Times(1)
+	mockDocker.EXPECT().PullImage(gomock.Any(), gomock.Any()).Return(nil).Times(2)
+
+	metadata := client.PullImage(image, authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
+
+	// Pull from the same registry but with different role
+	authData.ECRAuthData.SetPullCredentials(credentials.IAMRoleCredentials{
+		RoleArn: "executionRole2",
+	})
+	ecrClientFactory.EXPECT().GetClient(authData.ECRAuthData).Return(ecrClient, nil).Times(1)
+	ecrClient.EXPECT().GetAuthorizationToken(registryID).Return(
+		&ecrapi.AuthorizationData{
+			ProxyEndpoint:      aws.String("https://" + imageEndpoint),
+			AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
+			ExpiresAt:          aws.Time(time.Now().Add(10 * time.Hour)),
+		}, nil).Times(1)
+	metadata = client.PullImage(image, authData)
+	assert.NoError(t, metadata.Error, "Expected pull to succeed")
 }

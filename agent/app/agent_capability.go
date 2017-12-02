@@ -14,12 +14,14 @@
 package app
 
 import (
+	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/cihub/seelog"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -30,6 +32,7 @@ const (
 	taskENIAttributeSuffix                      = "task-eni"
 	taskENIBlockInstanceMetadataAttributeSuffix = "task-eni-block-instance-metadata"
 	cniPluginVersionSuffix                      = "cni-plugin-version"
+	capabilityTaskCPUMemLimit                   = "task-cpu-mem-limit"
 )
 
 // capabilities returns the supported capabilities of this agent / docker-client pair.
@@ -53,7 +56,9 @@ const (
 //    com.amazonaws.ecs.capability.task-iam-role-network-host
 //    ecs.capability.task-eni
 //    ecs.capability.task-eni-block-instance-metadata
-func (agent *ecsAgent) capabilities() []*ecs.Attribute {
+//    ecs.capability.execution-role-ecr-pull
+//    ecs.capability.execution-role-awslogs
+func (agent *ecsAgent) capabilities() ([]*ecs.Attribute, error) {
 	var capabilities []*ecs.Attribute
 
 	if !agent.cfg.PrivilegedDisabled {
@@ -91,6 +96,7 @@ func (agent *ecsAgent) capabilities() []*ecs.Attribute {
 
 	if _, ok := supportedVersions[dockerclient.Version_1_19]; ok {
 		capabilities = appendNameOnlyAttribute(capabilities, capabilityPrefix+"ecr-auth")
+		capabilities = appendNameOnlyAttribute(capabilities, attributePrefix+"execution-role-ecr-pull")
 	}
 
 	if agent.cfg.TaskIAMRoleEnabled {
@@ -113,6 +119,19 @@ func (agent *ecsAgent) capabilities() []*ecs.Attribute {
 		}
 	}
 
+	if agent.cfg.TaskCPUMemLimit.Enabled() {
+		if _, ok := supportedVersions[dockerclient.Version_1_22]; ok {
+			capabilities = appendNameOnlyAttribute(capabilities, attributePrefix+capabilityTaskCPUMemLimit)
+		} else if agent.cfg.TaskCPUMemLimit == config.ExplicitlyEnabled {
+			// explicitly enabled -- return an error because we cannot fulfil an explicit request
+			return nil, errors.New("engine: Task CPU + Mem limit cannot be enabled due to unsupported Docker version")
+		} else {
+			// implicitly enabled -- don't register the capability, but degrade gracefully
+			seelog.Warn("Task CPU + Mem Limit disabled due to unsupported Docker version. API version 1.22 or greater is required.")
+			agent.cfg.TaskCPUMemLimit = config.ExplicitlyDisabled
+		}
+	}
+
 	if agent.cfg.TaskENIEnabled {
 		// The assumption here is that all of the dependecies for supporting the
 		// Task ENI in the Agent have already been validated prior to the invocation of
@@ -122,7 +141,7 @@ func (agent *ecsAgent) capabilities() []*ecs.Attribute {
 		})
 		taskENIVersionAttribute, err := agent.getTaskENIPluginVersionAttribute()
 		if err != nil {
-			return capabilities
+			return capabilities, nil
 		}
 		capabilities = append(capabilities, taskENIVersionAttribute)
 		// We only care about AWSVPCBlockInstanceMetdata if Task ENI is enabled
@@ -133,10 +152,14 @@ func (agent *ecsAgent) capabilities() []*ecs.Attribute {
 				Name: aws.String(attributePrefix + taskENIBlockInstanceMetadataAttributeSuffix),
 			})
 		}
-
+	}
+	// TODO: gate this on docker api version when ecs supported docker includes
+	// credentials endpoint feature from upstream docker
+	if agent.cfg.OverrideAWSLogsExecutionRole {
+		capabilities = appendNameOnlyAttribute(capabilities, attributePrefix+"execution-role-awslogs")
 	}
 
-	return capabilities
+	return capabilities, nil
 }
 
 // getTaskENIPluginVersionAttribute returns the version information of the ECS

@@ -34,6 +34,7 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	utilsync "github.com/aws/amazon-ecs-agent/agent/utils/sync"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
+
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
 	"golang.org/x/net/context"
@@ -43,8 +44,13 @@ const (
 	//DockerEndpointEnvVariable is the environment variable that can override the Docker endpoint
 	DockerEndpointEnvVariable = "DOCKER_HOST"
 	// DockerDefaultEndpoint is the default value for the Docker endpoint
-	DockerDefaultEndpoint = "unix:///var/run/docker.sock"
-	labelPrefix           = "com.amazonaws.ecs."
+	DockerDefaultEndpoint        = "unix:///var/run/docker.sock"
+	capabilityPrefix             = "com.amazonaws.ecs.capability."
+	capabilityTaskIAMRole        = "task-iam-role"
+	capabilityTaskIAMRoleNetHost = "task-iam-role-network-host"
+	capabilityTaskCPUMemLimit    = "task-cpu-mem-limit"
+	labelPrefix                  = "com.amazonaws.ecs."
+	attributePrefix              = "ecs.capability."
 )
 
 // DockerTaskEngine is a state machine for managing a task and its containers
@@ -245,51 +251,72 @@ func (engine *DockerTaskEngine) synchronizeState() {
 	}
 
 	tasks := engine.state.AllTasks()
+	var tasksToStart []*api.Task
 	for _, task := range tasks {
 		conts, ok := engine.state.ContainerMapByArn(task.Arn)
 		if !ok {
-			engine.startTask(task)
+			// task hasn't started processing, no need to check container status
+			tasksToStart = append(tasksToStart, task)
 			continue
 		}
-		for _, cont := range conts {
-			if cont.DockerID == "" {
-				log.Debug("Found container potentially created while we were down", "name", cont.DockerName)
-				// Figure out the dockerid
-				describedCont, err := engine.client.InspectContainer(cont.DockerName, inspectContainerTimeout)
-				if err != nil {
-					log.Warn("Could not find matching container for expected", "name", cont.DockerName)
-				} else {
-					cont.DockerID = describedCont.ID
-					cont.Container.SetKnownStatus(dockerStateToState(describedCont.State))
-					// update mappings that need dockerid
-					engine.state.AddContainer(cont, task)
-					engine.imageManager.RecordContainerReference(cont.Container)
-				}
-			}
-			if cont.DockerID != "" {
-				currentState, metadata := engine.client.DescribeContainer(cont.DockerID)
-				if metadata.Error != nil {
-					currentState = api.ContainerStopped
-					if !cont.Container.KnownTerminal() {
-						cont.Container.ApplyingError = api.NewNamedError(&ContainerVanishedError{})
-						log.Warn("Could not describe previously known container; assuming dead", "err", metadata.Error, "id", cont.DockerID, "name", cont.DockerName)
-						engine.imageManager.RemoveContainerReferenceFromImageState(cont.Container)
-					}
-				} else {
-					engine.imageManager.RecordContainerReference(cont.Container)
-					if engine.cfg.ContainerMetadataEnabled && !cont.Container.IsMetadataFileUpdated() {
-						go engine.updateMetadataFile(task, cont)
-					}
 
-				}
-				if currentState > cont.Container.GetKnownStatus() {
-					cont.Container.SetKnownStatus(currentState)
-				}
-			}
+		for _, cont := range conts {
+			engine.synchronizeContainerStatus(cont, task)
 		}
+
+		tasksToStart = append(tasksToStart, task)
+
+		// Put tasks that are stopped by acs but hasn't been stopped in wait group
+		if task.GetDesiredStatus().Terminal() && task.GetStopSequenceNumber() != 0 {
+			engine.taskStopGroup.Add(task.GetStopSequenceNumber(), 1)
+		}
+	}
+
+	for _, task := range tasksToStart {
 		engine.startTask(task)
 	}
+
 	engine.saver.Save()
+}
+
+// synchronizeContainerStatus checks and updates the container status with docker
+func (engine *DockerTaskEngine) synchronizeContainerStatus(container *api.DockerContainer, task *api.Task) {
+	if container.DockerID == "" {
+		log.Debug("Found container potentially created while we were down", "name", container.DockerName)
+		// Figure out the dockerid
+		describedContainer, err := engine.client.InspectContainer(container.DockerName, inspectContainerTimeout)
+		if err != nil {
+			log.Warn("Could not find matching container for expected", "name", container.DockerName)
+		} else {
+			container.DockerID = describedContainer.ID
+			container.Container.SetKnownStatus(dockerStateToState(describedContainer.State))
+			// update mappings that need dockerid
+			engine.state.AddContainer(container, task)
+			engine.imageManager.RecordContainerReference(container.Container)
+		}
+		return
+	}
+
+	if container.DockerID != "" {
+		currentState, metadata := engine.client.DescribeContainer(container.DockerID)
+		if metadata.Error != nil {
+			currentState = api.ContainerStopped
+			if !container.Container.KnownTerminal() {
+				container.Container.ApplyingError = api.NewNamedError(&ContainerVanishedError{})
+				log.Warn("Could not describe previously known container; assuming dead", "err", metadata.Error, "id", container.DockerID, "name", container.DockerName)
+				engine.imageManager.RemoveContainerReferenceFromImageState(container.Container)
+			}
+		} else {
+			engine.imageManager.RecordContainerReference(container.Container)
+			if engine.cfg.ContainerMetadataEnabled && !container.Container.IsMetadataFileUpdated() {
+				go engine.updateMetadataFile(task, container)
+			}
+		}
+		if currentState > container.Container.GetKnownStatus() {
+			// update the container known status
+			container.Container.SetKnownStatus(currentState)
+		}
+	}
 }
 
 // CheckTaskState inspects the state of all containers within a task and writes
@@ -358,13 +385,17 @@ func (engine *DockerTaskEngine) emitTaskEvent(task *api.Task, reason string) {
 		log.Debug("Already sent task event; no need to re-send", "task", task.Arn, "event", taskKnownStatus.String())
 		return
 	}
+
 	event := api.TaskStateChange{
 		TaskARN: task.Arn,
 		Status:  taskKnownStatus,
 		Reason:  reason,
 		Task:    task,
 	}
-	log.Info("Task change event", "event", event)
+
+	event.SetTaskTimestamps()
+
+	seelog.Infof("Task change event: %s", event.String())
 	engine.stateChangeEvents <- event
 }
 
@@ -535,13 +566,19 @@ func (engine *DockerTaskEngine) pullContainer(task *api.Task, container *api.Con
 			return engine.client.ImportLocalEmptyVolumeImage()
 		}
 	}
+
+	// Record the pullStoppedAt timestamp
+	defer func() {
+		timestamp := engine.time().Now()
+		task.SetPullStoppedAt(timestamp)
+	}()
+
 	if engine.enableConcurrentPull {
 		seelog.Infof("Pulling container %v concurrently. Task: %v", container, task)
 		return engine.concurrentPull(task, container)
-	} else {
-		seelog.Infof("Pulling container %v serially. Task: %v", container, task)
-		return engine.serialPull(task, container)
 	}
+	seelog.Infof("Pulling container %v serially. Task: %v", container, task)
+	return engine.serialPull(task, container)
 }
 
 func (engine *DockerTaskEngine) concurrentPull(task *api.Task, container *api.Container) DockerContainerMetadata {
@@ -551,10 +588,16 @@ func (engine *DockerTaskEngine) concurrentPull(task *api.Task, container *api.Co
 	defer seelog.Debugf("Released ImagePullDeleteLock after pulling image - %s. Task: %v", container.Image, task)
 	defer ImagePullDeleteLock.RUnlock()
 
-	pullStart := time.Now()
+	// Record the task pull_started_at timestamp
+	pullStart := engine.time().Now()
 	defer func(startTime time.Time) {
 		seelog.Infof("Finished pulling container %v in %s. Task: %v", container.Image, time.Since(startTime).String(), task)
 	}(pullStart)
+	ok := task.SetPullStartedAt(pullStart)
+	if ok {
+		seelog.Infof("Recording timestamp for starting image pull, task %s, time: %s", task.String(), pullStart)
+	}
+
 	return engine.pullAndUpdateContainerReference(task, container)
 }
 
@@ -565,10 +608,15 @@ func (engine *DockerTaskEngine) serialPull(task *api.Task, container *api.Contai
 	defer seelog.Debugf("Released ImagePullDeleteLock after pulling image - %s. Task: %v", container.Image, task)
 	defer ImagePullDeleteLock.Unlock()
 
-	pullStart := time.Now()
+	pullStart := engine.time().Now()
 	defer func(startTime time.Time) {
 		seelog.Infof("Finished pulling container %v in %s. Task: %v", container.Image, time.Since(startTime).String(), task)
 	}(pullStart)
+	ok := task.SetPullStartedAt(pullStart)
+	if ok {
+		seelog.Infof("Recording timestamp for starting image pull, task %s, time: %s", task.String(), pullStart)
+	}
+
 	return engine.pullAndUpdateContainerReference(task, container)
 }
 
@@ -579,6 +627,20 @@ func (engine *DockerTaskEngine) pullAndUpdateContainerReference(task *api.Task, 
 		seelog.Infof("Task desired status is stopped, skip pull container: %v, task %v", container, task)
 		container.SetDesiredStatus(api.ContainerStopped)
 		return DockerContainerMetadata{Error: TaskStoppedBeforePullBeginError{task.Arn}}
+	}
+
+	// Set the credentials for pull from ECR if necessary
+	if container.ShouldPullWithExecutionRole() {
+		executionCredentials, ok := engine.credentialsManager.GetTaskCredentials(task.GetExecutionCredentialsID())
+		if !ok {
+			seelog.Infof("Acquiring ecr credentials from credential manager failed, container: %s, task: %s", container.String(), task.String())
+			return DockerContainerMetadata{Error: CannotPullECRContainerError{errors.New("engine ecr credentials acquisition: not found in credential manager")}}
+		}
+
+		iamCredentials := executionCredentials.GetIAMRoleCredentials()
+		container.SetRegistryAuthCredentials(iamCredentials)
+		// Clean up the ECR pull credentials after pulling
+		defer container.SetRegistryAuthCredentials(credentials.IAMRoleCredentials{})
 	}
 
 	metadata := engine.client.PullImage(container.Image, container.RegistryAuthentication)
@@ -623,12 +685,24 @@ func (engine *DockerTaskEngine) createContainer(task *api.Task, container *api.C
 	// we have to do this in create, not start, because docker no longer handles
 	// merging create config with start hostconfig the same; e.g. memory limits
 	// get lost
-	hostConfig, hcerr := task.DockerHostConfig(container, containerMap)
+	dockerClientVersion, versionErr := client.APIVersion()
+	if versionErr != nil {
+		return DockerContainerMetadata{Error: CannotGetDockerClientVersionError{versionErr}}
+	}
+
+	hostConfig, hcerr := task.DockerHostConfig(container, containerMap, dockerClientVersion)
 	if hcerr != nil {
 		return DockerContainerMetadata{Error: api.NamedError(hcerr)}
 	}
 
-	config, err := task.DockerConfig(container)
+	if container.AWSLogAuthExecutionRole() {
+		hcerr = task.ApplyExecutionRoleLogsAuth(hostConfig, engine.credentialsManager)
+		if hcerr != nil {
+			return DockerContainerMetadata{Error: api.NamedError(hcerr)}
+		}
+	}
+
+	config, err := task.DockerConfig(container, dockerClientVersion)
 	if err != nil {
 		return DockerContainerMetadata{Error: api.NamedError(err)}
 	}

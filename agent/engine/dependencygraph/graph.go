@@ -17,7 +17,21 @@ import (
 	"strings"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
+	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	log "github.com/cihub/seelog"
+	"github.com/pkg/errors"
+)
+
+var (
+	// UnableTransitionExecutionCredentialsNotResolved is the error where a container needs to wait for
+	// credentials before it can process by agent
+	UnableTransitionExecutionCredentialsNotResolved = errors.New("dependency graph: container execution credentials not available")
+	// UnableTransitionTransitionDependencyNotResolved is the error where a dependent container isn't in expected state
+	UnableTransitionTransitionDependencyNotResolved = errors.New("dependency graph: dependent container not in expected state")
+	// UnableTransitionContainerPassedDesiredStatus is the error where the container status is bigger than desired status
+	UnableTransitionContainerPassedDesiredStatus = errors.New("container transition: container status is equal or greater than desired status")
+	unableTransitionVolumesDependencyNotResolved = errors.New("dependency graph: container volume dependency not resolved")
+	unableTranstionLinksDependencyNotResolved    = errors.New("dependency graph: container links dependency not resolved")
 )
 
 // Because a container may depend on another container being created
@@ -84,7 +98,14 @@ func dependenciesCanBeResolved(target *api.Container, by []*api.Container) bool 
 // Transitions are between known statuses (whether the container can move to
 // the next known status), not desired statuses; the desired status typically
 // is either RUNNING or STOPPED.
-func DependenciesAreResolved(target *api.Container, by []*api.Container) bool {
+func DependenciesAreResolved(target *api.Container,
+	by []*api.Container,
+	id string,
+	manager credentials.Manager) error {
+	if !executionCredentialsResolved(target, id, manager) {
+		return UnableTransitionExecutionCredentialsNotResolved
+	}
+
 	nameMap := make(map[string]*api.Container)
 	for _, cont := range by {
 		nameMap[cont.Name] = cont
@@ -94,10 +115,20 @@ func DependenciesAreResolved(target *api.Container, by []*api.Container) bool {
 		neededVolumeContainers[i] = volume.SourceContainer
 	}
 
-	return verifyStatusResolvable(target, nameMap, neededVolumeContainers, volumeIsResolved) &&
-		verifyStatusResolvable(target, nameMap, linksToContainerNames(target.Links), linkIsResolved) &&
-		verifyStatusResolvable(target, nameMap, target.SteadyStateDependencies, onSteadyStateIsResolved) &&
-		verifyTransitionDependenciesResolved(target, nameMap)
+	if !verifyStatusResolvable(target, nameMap, neededVolumeContainers, volumeIsResolved) {
+		return unableTransitionVolumesDependencyNotResolved
+	}
+
+	if !verifyStatusResolvable(target, nameMap, linksToContainerNames(target.Links), linkIsResolved) {
+		return unableTranstionLinksDependencyNotResolved
+	}
+
+	if !verifyStatusResolvable(target, nameMap, target.SteadyStateDependencies, onSteadyStateIsResolved) ||
+		!verifyTransitionDependenciesResolved(target, nameMap) {
+		return UnableTransitionTransitionDependencyNotResolved
+	}
+
+	return nil
 }
 
 func linksToContainerNames(links []string) []string {
@@ -107,6 +138,17 @@ func linksToContainerNames(links []string) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+func executionCredentialsResolved(target *api.Container, id string, manager credentials.Manager) bool {
+	if target.GetKnownStatus() >= api.ContainerPulled ||
+		!target.ShouldPullWithExecutionRole() ||
+		target.GetDesiredStatus() >= api.ContainerStopped {
+		return true
+	}
+
+	_, ok := manager.GetTaskCredentials(id)
+	return ok
 }
 
 // verifyStatusResolvable validates that `target` can be resolved given that
