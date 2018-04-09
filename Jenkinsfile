@@ -11,7 +11,7 @@ node {
 
   stage("Build") {
     sh """
-echo ${image_tag} > VERSION
+./scripts/update-version ${image_tag}
 mkdir out
 make
 docker tag ${image}:make ${repo}/${image}:${image_tag}
