@@ -1,4 +1,5 @@
-//+build !integration
+//+build unit
+
 // Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
@@ -20,8 +21,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/api"
-	ecsengine "github.com/aws/amazon-ecs-agent/agent/engine"
+	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi/mocks"
 	mock_resolver "github.com/aws/amazon-ecs-agent/agent/stats/resolver/mock"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -34,24 +39,27 @@ func TestStatsEngineAddRemoveContainers(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(ctrl)
-	mockDockerClient := ecsengine.NewMockDockerClient(ctrl)
-	t1 := &api.Task{Arn: "t1", Family: "f1"}
-	t2 := &api.Task{Arn: "t2", Family: "f2"}
-	t3 := &api.Task{Arn: "t3"}
+	mockDockerClient := mock_dockerapi.NewMockDockerClient(ctrl)
+	t1 := &apitask.Task{Arn: "t1", Family: "f1"}
+	t2 := &apitask.Task{Arn: "t2", Family: "f2"}
+	t3 := &apitask.Task{Arn: "t3"}
 	resolver.EXPECT().ResolveTask("c1").AnyTimes().Return(t1, nil)
 	resolver.EXPECT().ResolveTask("c2").AnyTimes().Return(t1, nil)
 	resolver.EXPECT().ResolveTask("c3").AnyTimes().Return(t2, nil)
 	resolver.EXPECT().ResolveTask("c4").AnyTimes().Return(nil, fmt.Errorf("unmapped container"))
 	resolver.EXPECT().ResolveTask("c5").AnyTimes().Return(t2, nil)
 	resolver.EXPECT().ResolveTask("c6").AnyTimes().Return(t3, nil)
-	resolver.EXPECT().ResolveContainer(gomock.Any()).AnyTimes().Return(&api.DockerContainer{
-		Container: &api.Container{},
+	resolver.EXPECT().ResolveContainer(gomock.Any()).AnyTimes().Return(&apicontainer.DockerContainer{
+		Container: &apicontainer.Container{},
 	}, nil)
 	mockStatsChannel := make(chan *docker.Stats)
 	defer close(mockStatsChannel)
 	mockDockerClient.EXPECT().Stats(gomock.Any(), gomock.Any()).Return(mockStatsChannel, nil).AnyTimes()
 
 	engine := NewDockerStatsEngine(&cfg, nil, eventStream("TestStatsEngineAddRemoveContainers"))
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	engine.ctx = ctx
 	engine.resolver = resolver
 	engine.client = mockDockerClient
 	engine.cluster = defaultCluster
@@ -163,15 +171,18 @@ func TestStatsEngineMetadataInStatsSets(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(mockCtrl)
-	mockDockerClient := ecsengine.NewMockDockerClient(mockCtrl)
-	t1 := &api.Task{Arn: "t1", Family: "f1"}
+	mockDockerClient := mock_dockerapi.NewMockDockerClient(mockCtrl)
+	t1 := &apitask.Task{Arn: "t1", Family: "f1"}
 	resolver.EXPECT().ResolveTask("c1").AnyTimes().Return(t1, nil)
-	resolver.EXPECT().ResolveContainer(gomock.Any()).AnyTimes().Return(&api.DockerContainer{
-		Container: &api.Container{},
+	resolver.EXPECT().ResolveContainer(gomock.Any()).AnyTimes().Return(&apicontainer.DockerContainer{
+		Container: &apicontainer.Container{},
 	}, nil)
 	mockDockerClient.EXPECT().Stats(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 
 	engine := NewDockerStatsEngine(&cfg, nil, eventStream("TestStatsEngineMetadataInStatsSets"))
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	engine.ctx = ctx
 	engine.resolver = resolver
 	engine.cluster = defaultCluster
 	engine.containerInstanceArn = defaultContainerInstance
@@ -228,7 +239,9 @@ func TestStatsEngineMetadataInStatsSets(t *testing.T) {
 func TestStatsEngineInvalidTaskEngine(t *testing.T) {
 	statsEngine := NewDockerStatsEngine(&cfg, nil, eventStream("TestStatsEngineInvalidTaskEngine"))
 	taskEngine := &MockTaskEngine{}
-	err := statsEngine.MustInit(taskEngine, "", "")
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	err := statsEngine.MustInit(ctx, taskEngine, "", "")
 	if err == nil {
 		t.Error("Expected error in engine initialization, got nil")
 	}
@@ -249,12 +262,15 @@ func TestStatsEngineTerminalTask(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(mockCtrl)
-	resolver.EXPECT().ResolveTask("c1").Return(&api.Task{
+	resolver.EXPECT().ResolveTask("c1").Return(&apitask.Task{
 		Arn:               "t1",
-		KnownStatusUnsafe: api.TaskStopped,
+		KnownStatusUnsafe: apitaskstatus.TaskStopped,
 		Family:            "f1",
 	}, nil)
 	engine := NewDockerStatsEngine(&cfg, nil, eventStream("TestStatsEngineTerminalTask"))
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	engine.ctx = ctx
 	defer engine.removeAll()
 
 	engine.cluster = defaultCluster
@@ -271,19 +287,22 @@ func TestGetTaskHealthMetrics(t *testing.T) {
 
 	containerID := "containerID"
 	resolver := mock_resolver.NewMockContainerMetadataResolver(mockCtrl)
-	resolver.EXPECT().ResolveContainer(containerID).Return(&api.DockerContainer{
+	resolver.EXPECT().ResolveContainer(containerID).Return(&apicontainer.DockerContainer{
 		DockerID: containerID,
-		Container: &api.Container{
-			KnownStatusUnsafe: api.ContainerRunning,
+		Container: &apicontainer.Container{
+			KnownStatusUnsafe: apicontainerstatus.ContainerRunning,
 			HealthCheckType:   "docker",
-			Health: api.HealthStatus{
-				Status: api.ContainerHealthy,
+			Health: apicontainer.HealthStatus{
+				Status: apicontainerstatus.ContainerHealthy,
 				Since:  aws.Time(time.Now()),
 			},
 		},
 	}, nil).Times(2)
 
 	engine := NewDockerStatsEngine(&cfg, nil, eventStream("TestGetTaskHealthMetrics"))
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	engine.ctx = ctx
 	engine.containerInstanceArn = "container_instance"
 
 	containerToStats := make(map[string]*StatsContainer)
@@ -310,19 +329,22 @@ func TestGetTaskHealthMetricsStoppedContainer(t *testing.T) {
 
 	containerID := "containerID"
 	resolver := mock_resolver.NewMockContainerMetadataResolver(mockCtrl)
-	resolver.EXPECT().ResolveContainer(containerID).Return(&api.DockerContainer{
+	resolver.EXPECT().ResolveContainer(containerID).Return(&apicontainer.DockerContainer{
 		DockerID: containerID,
-		Container: &api.Container{
-			KnownStatusUnsafe: api.ContainerStopped,
+		Container: &apicontainer.Container{
+			KnownStatusUnsafe: apicontainerstatus.ContainerStopped,
 			HealthCheckType:   "docker",
-			Health: api.HealthStatus{
-				Status: api.ContainerHealthy,
+			Health: apicontainer.HealthStatus{
+				Status: apicontainerstatus.ContainerHealthy,
 				Since:  aws.Time(time.Now()),
 			},
 		},
 	}, nil)
 
 	engine := NewDockerStatsEngine(&cfg, nil, eventStream("TestGetTaskHealthMetrics"))
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	engine.ctx = ctx
 	engine.containerInstanceArn = "container_instance"
 
 	containerToStats := make(map[string]*StatsContainer)
@@ -348,19 +370,22 @@ func TestMetricsDisabled(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 	resolver := mock_resolver.NewMockContainerMetadataResolver(mockCtrl)
-	resolver.EXPECT().ResolveTask(containerID).Return(&api.Task{
+	resolver.EXPECT().ResolveTask(containerID).Return(&apitask.Task{
 		Arn:               "t1",
-		KnownStatusUnsafe: api.TaskRunning,
+		KnownStatusUnsafe: apitaskstatus.TaskRunning,
 		Family:            "f1",
 	}, nil)
-	resolver.EXPECT().ResolveContainer(containerID).Return(&api.DockerContainer{
+	resolver.EXPECT().ResolveContainer(containerID).Return(&apicontainer.DockerContainer{
 		DockerID: containerID,
-		Container: &api.Container{
+		Container: &apicontainer.Container{
 			HealthCheckType: "docker",
 		},
 	}, nil)
 
 	engine := NewDockerStatsEngine(&disableMetricsConfig, nil, eventStream("TestMetricsDisabled"))
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	engine.ctx = ctx
 	engine.resolver = resolver
 	engine.addAndStartStatsContainer(containerID)
 
@@ -375,27 +400,30 @@ func TestSynchronizeOnRestart(t *testing.T) {
 	containerID := "containerID"
 	statsChan := make(chan *docker.Stats)
 	statsStarted := make(chan struct{})
-	client := ecsengine.NewMockDockerClient(ctrl)
+	client := mock_dockerapi.NewMockDockerClient(ctrl)
 	resolver := mock_resolver.NewMockContainerMetadataResolver(ctrl)
 
 	engine := NewDockerStatsEngine(&cfg, client, eventStream("TestSynchronizeOnRestart"))
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	engine.ctx = ctx
 	engine.resolver = resolver
 
-	client.EXPECT().ListContainers(false, gomock.Any()).Return(ecsengine.ListContainersResponse{
+	client.EXPECT().ListContainers(gomock.Any(), false, gomock.Any()).Return(dockerapi.ListContainersResponse{
 		DockerIDs: []string{containerID},
 	})
 	client.EXPECT().Stats(containerID, gomock.Any()).Do(func(id string, ctx context.Context) {
 		statsStarted <- struct{}{}
 	}).Return(statsChan, nil)
 
-	resolver.EXPECT().ResolveTask(containerID).Return(&api.Task{
+	resolver.EXPECT().ResolveTask(containerID).Return(&apitask.Task{
 		Arn:               "t1",
-		KnownStatusUnsafe: api.TaskRunning,
+		KnownStatusUnsafe: apitaskstatus.TaskRunning,
 		Family:            "f1",
 	}, nil)
-	resolver.EXPECT().ResolveContainer(containerID).Return(&api.DockerContainer{
+	resolver.EXPECT().ResolveContainer(containerID).Return(&apicontainer.DockerContainer{
 		DockerID: containerID,
-		Container: &api.Container{
+		Container: &apicontainer.Container{
 			HealthCheckType: "docker",
 		},
 	}, nil)

@@ -1,4 +1,4 @@
-// Copyright 2014-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -19,6 +19,7 @@ import (
 	"sync"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	"github.com/cihub/seelog"
@@ -106,7 +107,7 @@ func (event *sendableEvent) taskAttachmentShouldBeSent() bool {
 		return false
 	}
 	tevent := event.taskChange
-	return tevent.Status == api.TaskStatusNone && // Task Status is not set for attachments as task record has yet to be streamed down
+	return tevent.Status == apitaskstatus.TaskStatusNone && // Task Status is not set for attachments as task record has yet to be streamed down
 		tevent.Attachment != nil && // Task has attachment records
 		!tevent.Attachment.HasExpired() && // ENI attachment ack timestamp hasn't expired
 		!tevent.Attachment.IsSent() // Task status hasn't already been sent
@@ -160,7 +161,7 @@ func (event *sendableEvent) send(
 	setChangeSent(event)
 	// Update the state file
 	stateSaver.Save()
-	seelog.Debugf("TaskHandler: Submitted container state change: %s", event.toString())
+	seelog.Debugf("TaskHandler: Submitted task state change: %s", event.toString())
 	taskEvents.events.Remove(eventToSubmit)
 	backoff.Reset()
 	return nil
@@ -186,19 +187,26 @@ type setStatusSent func(event *sendableEvent)
 
 // setContainerChangeSent sets the event's container change object as sent
 func setContainerChangeSent(event *sendableEvent) {
-	if event.containerChange.Container != nil {
-		event.containerChange.Container.SetSentStatus(event.containerChange.Status)
+	containerChangeStatus := event.containerChange.Status
+	container := event.containerChange.Container
+	if container != nil && container.GetSentStatus() < containerChangeStatus {
+		container.SetSentStatus(containerChangeStatus)
 	}
 }
 
 // setTaskChangeSent sets the event's task change object as sent
 func setTaskChangeSent(event *sendableEvent) {
-	if event.taskChange.Task != nil {
-		event.taskChange.Task.SetSentStatus(event.taskChange.Status)
+	taskChangeStatus := event.taskChange.Status
+	task := event.taskChange.Task
+	if task != nil && task.GetSentStatus() < taskChangeStatus {
+		task.SetSentStatus(taskChangeStatus)
 	}
 	for _, containerStateChange := range event.taskChange.Containers {
 		container := containerStateChange.Container
-		container.SetSentStatus(containerStateChange.Status)
+		containerChangeStatus := containerStateChange.Status
+		if container.GetSentStatus() < containerChangeStatus {
+			container.SetSentStatus(containerStateChange.Status)
+		}
 	}
 }
 

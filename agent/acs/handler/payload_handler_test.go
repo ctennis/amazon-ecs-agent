@@ -1,4 +1,6 @@
-// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// +build unit
+
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -18,14 +20,18 @@ import (
 	"testing"
 
 	"context"
+
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/api/mocks"
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
+	apitaskstatus "github.com/aws/amazon-ecs-agent/agent/api/task/status"
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
-	"github.com/aws/amazon-ecs-agent/agent/engine"
+	"github.com/aws/amazon-ecs-agent/agent/engine/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/eventhandler"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager/mocks"
+	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	"github.com/aws/amazon-ecs-agent/agent/wsclient/mock"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/golang/mock/gomock"
@@ -42,7 +48,7 @@ const (
 type testHelper struct {
 	ctrl               *gomock.Controller
 	payloadHandler     payloadRequestHandler
-	mockTaskEngine     *engine.MockTaskEngine
+	mockTaskEngine     *mock_engine.MockTaskEngine
 	ecsClient          api.ECSClient
 	mockWsClient       *mock_wsclient.MockClientServer
 	saver              statemanager.Saver
@@ -54,7 +60,7 @@ type testHelper struct {
 
 func setup(t *testing.T) *testHelper {
 	ctrl := gomock.NewController(t)
-	taskEngine := engine.NewMockTaskEngine(ctrl)
+	taskEngine := mock_engine.NewMockTaskEngine(ctrl)
 	ecsClient := mock_api.NewMockECSClient(ctrl)
 	mockWsClient := mock_wsclient.NewMockClientServer(ctrl)
 	stateManager := statemanager.NewNoopStateManager()
@@ -110,42 +116,6 @@ func TestHandlePayloadMessageWithNoMessageId(t *testing.T) {
 	assert.Error(t, err, "Expected error while adding a task with no message id")
 }
 
-// TestHandlePayloadMessageAddTaskError tests that agent does not ack payload messages
-// when task engine fails to add tasks
-func TestHandlePayloadMessageAddTaskError(t *testing.T) {
-	tester := setup(t)
-	defer tester.ctrl.Finish()
-
-	// Return error from AddTask
-	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Return(fmt.Errorf("oops")).Times(2)
-
-	// Test AddTask error with RUNNING task
-	payloadMessage := &ecsacs.PayloadMessage{
-		Tasks: []*ecsacs.Task{
-			{
-				Arn:           aws.String("t1"),
-				DesiredStatus: aws.String("RUNNING"),
-			},
-		},
-		MessageId: aws.String(payloadMessageId),
-	}
-	err := tester.payloadHandler.handleSingleMessage(payloadMessage)
-	assert.Error(t, err, "Expected error while adding the task")
-
-	payloadMessage = &ecsacs.PayloadMessage{
-		Tasks: []*ecsacs.Task{
-			{
-				Arn:           aws.String("t1"),
-				DesiredStatus: aws.String("STOPPED"),
-			},
-		},
-		MessageId: aws.String(payloadMessageId),
-	}
-	// Test AddTask error with STOPPED task
-	err = tester.payloadHandler.handleSingleMessage(payloadMessage)
-	assert.Error(t, err, "Expected error while adding the task")
-}
-
 // TestHandlePayloadMessageStateSaveError tests that agent does not ack payload messages
 // when state saver fails to save state
 func TestHandlePayloadMessageStateSaveError(t *testing.T) {
@@ -153,8 +123,8 @@ func TestHandlePayloadMessageStateSaveError(t *testing.T) {
 	defer tester.ctrl.Finish()
 
 	// Save added task in the addedTask variable
-	var addedTask *api.Task
-	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	var addedTask *apitask.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *apitask.Task) {
 		addedTask = task
 	}).Times(1)
 
@@ -175,8 +145,9 @@ func TestHandlePayloadMessageStateSaveError(t *testing.T) {
 	assert.Error(t, err, "Expected error while adding a task from statemanager")
 
 	// We expect task to be added to the engine even though it hasn't been saved
-	expectedTask := &api.Task{
-		Arn: "t1",
+	expectedTask := &apitask.Task{
+		Arn:                "t1",
+		ResourcesMapUnsafe: make(map[string][]taskresource.TaskResource),
 	}
 
 	assert.Equal(t, addedTask, expectedTask, "added task is not expected")
@@ -188,8 +159,8 @@ func TestHandlePayloadMessageAckedWhenTaskAdded(t *testing.T) {
 	tester := setup(t)
 	defer tester.ctrl.Finish()
 
-	var addedTask *api.Task
-	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	var addedTask *apitask.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *apitask.Task) {
 		addedTask = task
 	}).Times(1)
 
@@ -221,8 +192,9 @@ func TestHandlePayloadMessageAckedWhenTaskAdded(t *testing.T) {
 	assert.Equal(t, aws.StringValue(ackRequested.MessageId), payloadMessageId, "received message is not expected")
 
 	// Verify if task added == expected task
-	expectedTask := &api.Task{
-		Arn: "t1",
+	expectedTask := &apitask.Task{
+		Arn:                "t1",
+		ResourcesMapUnsafe: make(map[string][]taskresource.TaskResource),
 	}
 	assert.Equal(t, addedTask, expectedTask, "received task is not expected")
 }
@@ -234,8 +206,8 @@ func TestHandlePayloadMessageCredentialsAckedWhenTaskAdded(t *testing.T) {
 	tester := setup(t)
 	defer tester.ctrl.Finish()
 
-	var addedTask *api.Task
-	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	var addedTask *apitask.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *apitask.Task) {
 		addedTask = task
 	}).Times(1)
 
@@ -325,8 +297,8 @@ func TestAddPayloadTaskAddsNonStoppedTasksAfterStoppedTasks(t *testing.T) {
 	tester := setup(t)
 	defer tester.ctrl.Finish()
 
-	var tasksAddedToEngine []*api.Task
-	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	var tasksAddedToEngine []*apitask.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *apitask.Task) {
 		tasksAddedToEngine = append(tasksAddedToEngine, task)
 	}).Times(2)
 
@@ -353,11 +325,11 @@ func TestAddPayloadTaskAddsNonStoppedTasksAfterStoppedTasks(t *testing.T) {
 	// Verify if stopped task is added before running task
 	firstTaskAdded := tasksAddedToEngine[0]
 	assert.Equal(t, firstTaskAdded.Arn, stoppedTaskArn)
-	assert.Equal(t, firstTaskAdded.GetDesiredStatus(), api.TaskStopped)
+	assert.Equal(t, firstTaskAdded.GetDesiredStatus(), apitaskstatus.TaskStopped)
 
 	secondTaskAdded := tasksAddedToEngine[1]
 	assert.Equal(t, secondTaskAdded.Arn, runningTaskArn)
-	assert.Equal(t, secondTaskAdded.GetDesiredStatus(), api.TaskRunning)
+	assert.Equal(t, secondTaskAdded.GetDesiredStatus(), apitaskstatus.TaskRunning)
 }
 
 // TestPayloadBufferHandler tests if the async payloadBufferHandler routine
@@ -366,8 +338,8 @@ func TestPayloadBufferHandler(t *testing.T) {
 	tester := setup(t)
 	defer tester.ctrl.Finish()
 
-	var addedTask *api.Task
-	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	var addedTask *apitask.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *apitask.Task) {
 		addedTask = task
 	}).Times(1)
 
@@ -397,8 +369,9 @@ func TestPayloadBufferHandler(t *testing.T) {
 	assert.Equal(t, aws.StringValue(ackRequested.MessageId), payloadMessageId, "received task is not expected")
 
 	// Verify if the task added to the engine is correct
-	expectedTask := &api.Task{
-		Arn: taskArn,
+	expectedTask := &apitask.Task{
+		Arn:                taskArn,
+		ResourcesMapUnsafe: make(map[string][]taskresource.TaskResource),
 	}
 	assert.Equal(t, addedTask, expectedTask, "received task is not expected")
 }
@@ -411,13 +384,13 @@ func TestPayloadBufferHandlerWithCredentials(t *testing.T) {
 
 	// The payload message in the test consists of two tasks, record both of them in
 	// the order in which they were added
-	var firstAddedTask *api.Task
-	var secondAddedTask *api.Task
+	var firstAddedTask *apitask.Task
+	var secondAddedTask *apitask.Task
 	gomock.InOrder(
-		tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+		tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *apitask.Task) {
 			firstAddedTask = task
 		}),
-		tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+		tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *apitask.Task) {
 			secondAddedTask = task
 		}),
 	)
@@ -548,8 +521,8 @@ func TestAddPayloadTaskAddsExecutionRoles(t *testing.T) {
 	tester := setup(t)
 	defer tester.ctrl.Finish()
 
-	var addedTask *api.Task
-	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *api.Task) {
+	var addedTask *apitask.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(func(task *apitask.Task) {
 		addedTask = task
 	})
 
@@ -622,15 +595,16 @@ func TestAddPayloadTaskAddsExecutionRoles(t *testing.T) {
 // comparisons fail
 func validateTaskAndCredentials(taskCredentialsAck,
 	expectedCredentialsAckForTask *ecsacs.IAMRoleCredentialsAckRequest,
-	addedTask *api.Task,
+	addedTask *apitask.Task,
 	expectedTaskArn string,
 	expectedTaskCredentials credentials.IAMRoleCredentials) error {
 	if !reflect.DeepEqual(taskCredentialsAck, expectedCredentialsAckForTask) {
 		return fmt.Errorf("Mismatch between expected and received credentials ack requests, expected: %s, got: %s", expectedCredentialsAckForTask.String(), taskCredentialsAck.String())
 	}
 
-	expectedTask := &api.Task{
-		Arn: expectedTaskArn,
+	expectedTask := &apitask.Task{
+		Arn:                expectedTaskArn,
+		ResourcesMapUnsafe: make(map[string][]taskresource.TaskResource),
 	}
 	expectedTask.SetCredentialsID(expectedTaskCredentials.CredentialsID)
 
@@ -644,9 +618,9 @@ func TestPayloadHandlerAddedENIToTask(t *testing.T) {
 	tester := setup(t)
 	defer tester.ctrl.Finish()
 
-	var addedTask *api.Task
+	var addedTask *apitask.Task
 	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(
-		func(task *api.Task) {
+		func(task *apitask.Task) {
 			addedTask = task
 		})
 
@@ -689,4 +663,94 @@ func TestPayloadHandlerAddedENIToTask(t *testing.T) {
 	assert.Equal(t, 1, len(taskeni.IPV6Addresses))
 	assert.Equal(t, aws.StringValue(expectedENI.Ipv4Addresses[0].PrivateAddress), taskeni.IPV4Addresses[0].Address)
 	assert.Equal(t, aws.StringValue(expectedENI.Ipv6Addresses[0].Address), taskeni.IPV6Addresses[0].Address)
+}
+
+func TestPayloadHandlerAddedECRAuthData(t *testing.T) {
+	tester := setup(t)
+	defer tester.ctrl.Finish()
+
+	var addedTask *apitask.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(
+		func(task *apitask.Task) {
+			addedTask = task
+		})
+
+	payloadMessage := &ecsacs.PayloadMessage{
+		Tasks: []*ecsacs.Task{
+			{
+				Arn: aws.String("arn"),
+				Containers: []*ecsacs.Container{
+					{
+						RegistryAuthentication: &ecsacs.RegistryAuthenticationData{
+							Type: aws.String("ecr"),
+							EcrAuthData: &ecsacs.ECRAuthData{
+								Region:     aws.String("us-west-2"),
+								RegistryId: aws.String("registry-id"),
+							},
+						},
+					},
+				},
+			},
+		},
+		MessageId: aws.String(payloadMessageId),
+	}
+
+	err := tester.payloadHandler.handleSingleMessage(payloadMessage)
+	assert.NoError(t, err)
+
+	// Validate the added task has the ECRAuthData information as expected
+	expected := payloadMessage.Tasks[0].Containers[0].RegistryAuthentication
+	actual := addedTask.Containers[0].RegistryAuthentication
+
+	assert.NotNil(t, actual.ECRAuthData)
+	assert.Nil(t, actual.ASMAuthData)
+
+	assert.Equal(t, aws.StringValue(expected.Type), actual.Type)
+	assert.Equal(t, aws.StringValue(expected.EcrAuthData.Region), actual.ECRAuthData.Region)
+	assert.Equal(t, aws.StringValue(expected.EcrAuthData.RegistryId), actual.ECRAuthData.RegistryID)
+}
+
+func TestPayloadHandlerAddedASMAuthData(t *testing.T) {
+	tester := setup(t)
+	defer tester.ctrl.Finish()
+
+	var addedTask *apitask.Task
+	tester.mockTaskEngine.EXPECT().AddTask(gomock.Any()).Do(
+		func(task *apitask.Task) {
+			addedTask = task
+		})
+
+	payloadMessage := &ecsacs.PayloadMessage{
+		Tasks: []*ecsacs.Task{
+			{
+				Arn: aws.String("arn"),
+				Containers: []*ecsacs.Container{
+					{
+						RegistryAuthentication: &ecsacs.RegistryAuthenticationData{
+							Type: aws.String("asm"),
+							AsmAuthData: &ecsacs.ASMAuthData{
+								Region:               aws.String("us-west-2"),
+								CredentialsParameter: aws.String("asm-arn"),
+							},
+						},
+					},
+				},
+			},
+		},
+		MessageId: aws.String(payloadMessageId),
+	}
+
+	err := tester.payloadHandler.handleSingleMessage(payloadMessage)
+	assert.NoError(t, err)
+
+	// Validate the added task has the ASMAuthData information as expected
+	expected := payloadMessage.Tasks[0].Containers[0].RegistryAuthentication
+	actual := addedTask.Containers[0].RegistryAuthentication
+
+	assert.NotNil(t, actual.ASMAuthData)
+	assert.Nil(t, actual.ECRAuthData)
+
+	assert.Equal(t, aws.StringValue(expected.Type), actual.Type)
+	assert.Equal(t, aws.StringValue(expected.AsmAuthData.Region), actual.ASMAuthData.Region)
+	assert.Equal(t, aws.StringValue(expected.AsmAuthData.CredentialsParameter), actual.ASMAuthData.CredentialsParameter)
 }

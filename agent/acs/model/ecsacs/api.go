@@ -15,6 +15,24 @@ package ecsacs
 
 import "github.com/aws/aws-sdk-go/aws/awsutil"
 
+type ASMAuthData struct {
+	_ struct{} `type:"structure"`
+
+	CredentialsParameter *string `locationName:"credentialsParameter" type:"string"`
+
+	Region *string `locationName:"region" type:"string"`
+}
+
+// String returns the string representation
+func (s ASMAuthData) String() string {
+	return awsutil.Prettify(s)
+}
+
+// GoString returns the string representation
+func (s ASMAuthData) GoString() string {
+	return s.String()
+}
+
 type AccessDeniedException struct {
 	_ struct{} `type:"structure"`
 
@@ -179,6 +197,30 @@ func (s DockerConfig) GoString() string {
 	return s.String()
 }
 
+type DockerVolumeConfiguration struct {
+	_ struct{} `type:"structure"`
+
+	Autoprovision *bool `locationName:"autoprovision" type:"boolean"`
+
+	Driver *string `locationName:"driver" type:"string"`
+
+	DriverOpts map[string]*string `locationName:"driverOpts" type:"map"`
+
+	Labels map[string]*string `locationName:"labels" type:"map"`
+
+	Scope *string `locationName:"scope" type:"string" enum:"Scope"`
+}
+
+// String returns the string representation
+func (s DockerVolumeConfiguration) String() string {
+	return awsutil.Prettify(s)
+}
+
+// GoString returns the string representation
+func (s DockerVolumeConfiguration) GoString() string {
+	return s.String()
+}
+
 type ECRAuthData struct {
 	_ struct{} `type:"structure"`
 
@@ -219,6 +261,8 @@ type ElasticNetworkInterface struct {
 	MacAddress *string `locationName:"macAddress" type:"string"`
 
 	PrivateDnsName *string `locationName:"privateDnsName" type:"string"`
+
+	SubnetGatewayIpv4Address *string `locationName:"subnetGatewayIpv4Address" type:"string"`
 }
 
 // String returns the string representation
@@ -594,6 +638,8 @@ func (s PortMapping) GoString() string {
 type RegistryAuthenticationData struct {
 	_ struct{} `type:"structure"`
 
+	AsmAuthData *ASMAuthData `locationName:"asmAuthData" type:"structure"`
+
 	EcrAuthData *ECRAuthData `locationName:"ecrAuthData" type:"structure"`
 
 	Type *string `locationName:"type" type:"string" enum:"AuthenticationType"`
@@ -742,9 +788,13 @@ func (s VersionInfo) GoString() string {
 type Volume struct {
 	_ struct{} `type:"structure"`
 
+	DockerVolumeConfiguration *DockerVolumeConfiguration `locationName:"dockerVolumeConfiguration" type:"structure"`
+
 	Host *HostVolumeProperties `locationName:"host" type:"structure"`
 
 	Name *string `locationName:"name" type:"string"`
+
+	Type *string `locationName:"type" type:"string" enum:"VolumeType"`
 }
 
 // String returns the string representation

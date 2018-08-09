@@ -1,4 +1,6 @@
-// Copyright 2014-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// +build unit
+
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -81,6 +83,8 @@ const (
 	TestInstanceArn = "arn:aws:ec2:123:container/containerInstance/12345678"
 	rwTimeout       = time.Second
 )
+
+var testCreds = credentials.NewStaticCredentials("test-id", "test-secret", "test-token")
 
 var testCfg = &config.Config{
 	AcceptInsecureCert: true,
@@ -235,7 +239,7 @@ func TestConnect(t *testing.T) {
 		t.Fatal(<-serverErr)
 	}()
 
-	cs := New(server.URL, testCfg, credentials.AnonymousCredentials, rwTimeout)
+	cs := New(server.URL, testCfg, testCreds, rwTimeout)
 	// Wait for up to a second for the mock server to launch
 	for i := 0; i < 100; i++ {
 		err = cs.Connect()
@@ -306,7 +310,7 @@ func TestConnectClientError(t *testing.T) {
 	}))
 	defer testServer.Close()
 
-	cs := New(testServer.URL, testCfg, credentials.AnonymousCredentials, rwTimeout)
+	cs := New(testServer.URL, testCfg, testCreds, rwTimeout)
 	err := cs.Connect()
 	_, ok := err.(*wsclient.WSError)
 	assert.True(t, ok)
@@ -314,7 +318,6 @@ func TestConnectClientError(t *testing.T) {
 }
 
 func testCS(conn *mock_wsconn.MockWebsocketConn) wsclient.ClientServer {
-	testCreds := credentials.AnonymousCredentials
 	foo := New("localhost:443", testCfg, testCreds, rwTimeout)
 	cs := foo.(*clientServer)
 	cs.SetConnection(conn)

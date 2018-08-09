@@ -18,7 +18,9 @@
 package mock_ecscni
 
 import (
+	context "context"
 	reflect "reflect"
+	time "time"
 
 	ecscni "github.com/aws/amazon-ecs-agent/agent/ecscni"
 	current "github.com/containernetworking/cni/pkg/types/current"
@@ -62,15 +64,15 @@ func (mr *MockCNIClientMockRecorder) Capabilities(arg0 interface{}) *gomock.Call
 }
 
 // CleanupNS mocks base method
-func (m *MockCNIClient) CleanupNS(arg0 *ecscni.Config) error {
-	ret := m.ctrl.Call(m, "CleanupNS", arg0)
+func (m *MockCNIClient) CleanupNS(arg0 context.Context, arg1 *ecscni.Config, arg2 time.Duration) error {
+	ret := m.ctrl.Call(m, "CleanupNS", arg0, arg1, arg2)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // CleanupNS indicates an expected call of CleanupNS
-func (mr *MockCNIClientMockRecorder) CleanupNS(arg0 interface{}) *gomock.Call {
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CleanupNS", reflect.TypeOf((*MockCNIClient)(nil).CleanupNS), arg0)
+func (mr *MockCNIClientMockRecorder) CleanupNS(arg0, arg1, arg2 interface{}) *gomock.Call {
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CleanupNS", reflect.TypeOf((*MockCNIClient)(nil).CleanupNS), arg0, arg1, arg2)
 }
 
 // ReleaseIPResource mocks base method
@@ -86,16 +88,16 @@ func (mr *MockCNIClientMockRecorder) ReleaseIPResource(arg0 interface{}) *gomock
 }
 
 // SetupNS mocks base method
-func (m *MockCNIClient) SetupNS(arg0 *ecscni.Config) (*current.Result, error) {
-	ret := m.ctrl.Call(m, "SetupNS", arg0)
+func (m *MockCNIClient) SetupNS(arg0 context.Context, arg1 *ecscni.Config, arg2 time.Duration) (*current.Result, error) {
+	ret := m.ctrl.Call(m, "SetupNS", arg0, arg1, arg2)
 	ret0, _ := ret[0].(*current.Result)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // SetupNS indicates an expected call of SetupNS
-func (mr *MockCNIClientMockRecorder) SetupNS(arg0 interface{}) *gomock.Call {
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetupNS", reflect.TypeOf((*MockCNIClient)(nil).SetupNS), arg0)
+func (mr *MockCNIClientMockRecorder) SetupNS(arg0, arg1, arg2 interface{}) *gomock.Call {
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetupNS", reflect.TypeOf((*MockCNIClient)(nil).SetupNS), arg0, arg1, arg2)
 }
 
 // Version mocks base method

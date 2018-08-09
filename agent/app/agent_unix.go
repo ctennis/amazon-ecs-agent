@@ -1,6 +1,6 @@
 // +build linux
 
-// Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2017-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -19,6 +19,9 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/aws/amazon-ecs-agent/agent/asm/factory"
+	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/engine"
@@ -27,6 +30,9 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/eni/udevwrapper"
 	"github.com/aws/amazon-ecs-agent/agent/eni/watcher"
 	"github.com/aws/amazon-ecs-agent/agent/statechange"
+	"github.com/aws/amazon-ecs-agent/agent/taskresource"
+	cgroup "github.com/aws/amazon-ecs-agent/agent/taskresource/cgroup/control"
+	"github.com/aws/amazon-ecs-agent/agent/utils/ioutilwrapper"
 	"github.com/cihub/seelog"
 	"github.com/pkg/errors"
 )
@@ -77,7 +83,7 @@ func (agent *ecsAgent) initializeTaskENIDependencies(state dockerstate.TaskEngin
 
 	if agent.cfg.ShouldLoadPauseContainerTarball() {
 		// Load the pause container's image from the 'disk'
-		if _, err := agent.pauseLoader.LoadImage(agent.cfg, agent.dockerClient); err != nil {
+		if _, err := agent.pauseLoader.LoadImage(agent.ctx, agent.cfg, agent.dockerClient); err != nil {
 			if pause.IsNoSuchFileError(err) || pause.UnsupportedPlatform(err) {
 				// If the pause container's image tarball doesn't exist or if the
 				// invocation is done for an unsupported platform, we cannot recover.
@@ -182,4 +188,34 @@ func contains(capabilities []string, capability string) bool {
 	}
 
 	return false
+}
+
+// initializeResourceFields exists mainly for testing doStart() to use mock Control
+// object
+func (agent *ecsAgent) initializeResourceFields(credentialsManager credentials.Manager) {
+	agent.resourceFields = &taskresource.ResourceFields{
+		Control: cgroup.New(),
+		ResourceFieldsCommon: &taskresource.ResourceFieldsCommon{
+			IOUtil:             ioutilwrapper.NewIOUtil(),
+			ASMClientCreator:   factory.NewClientCreator(),
+			CredentialsManager: credentialsManager,
+		},
+		Ctx:          agent.ctx,
+		DockerClient: agent.dockerClient,
+	}
+}
+
+func (agent *ecsAgent) cgroupInit() error {
+	err := agent.resourceFields.Control.Init()
+	// When task CPU and memory limits are enabled, all tasks are placed
+	// under the '/ecs' cgroup root.
+	if err == nil {
+		return nil
+	}
+	if agent.cfg.TaskCPUMemLimit == config.ExplicitlyEnabled {
+		return errors.Wrapf(err, "unable to setup '/ecs' cgroup")
+	}
+	seelog.Warnf("Disabling TaskCPUMemLimit because agent is unabled to setup '/ecs' cgroup: %v", err)
+	agent.cfg.TaskCPUMemLimit = config.ExplicitlyDisabled
+	return nil
 }

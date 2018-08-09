@@ -19,22 +19,23 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/eventstream"
-	"github.com/aws/amazon-ecs-agent/agent/resources"
+	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 )
 
 // NewTaskEngine returns a default TaskEngine
-func NewTaskEngine(cfg *config.Config, client DockerClient,
+func NewTaskEngine(cfg *config.Config, client dockerapi.DockerClient,
 	credentialsManager credentials.Manager,
 	containerChangeEventStream *eventstream.EventStream,
 	imageManager ImageManager, state dockerstate.TaskEngineState,
 	metadataManager containermetadata.Manager,
-	resource resources.Resource) TaskEngine {
+	resourceFields *taskresource.ResourceFields) TaskEngine {
 
 	taskEngine := NewDockerTaskEngine(cfg, client, credentialsManager,
 		containerChangeEventStream, imageManager,
-		state, metadataManager, resource)
+		state, metadataManager, resourceFields)
 
 	return taskEngine
 }

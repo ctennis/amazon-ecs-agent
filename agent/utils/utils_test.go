@@ -1,4 +1,6 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// +build unit
+
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -19,8 +21,12 @@ import (
 	"testing"
 	"time"
 
+	apierrors "github.com/aws/amazon-ecs-agent/agent/api/errors"
+	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime/mocks"
+
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 )
@@ -114,7 +120,7 @@ func TestRetryWithBackoff(t *testing.T) {
 	t.Run("no retries", func(t *testing.T) {
 		// no sleeps
 		RetryWithBackoff(NewSimpleBackoff(10*time.Second, 20*time.Second, 0, 2), func() error {
-			return NewRetriableError(NewRetriable(false), errors.New("can't retry"))
+			return apierrors.NewRetriableError(apierrors.NewRetriable(false), errors.New("can't retry"))
 		})
 	})
 }
@@ -142,7 +148,7 @@ func TestRetryWithBackoffCtx(t *testing.T) {
 	t.Run("no retries", func(t *testing.T) {
 		// no sleeps
 		RetryWithBackoffCtx(context.TODO(), NewSimpleBackoff(10*time.Second, 20*time.Second, 0, 2), func() error {
-			return NewRetriableError(NewRetriable(false), errors.New("can't retry"))
+			return apierrors.NewRetriableError(apierrors.NewRetriable(false), errors.New("can't retry"))
 		})
 	})
 
@@ -271,6 +277,36 @@ func TestParseBool(t *testing.T) {
 		t.Run("defaults", func(t *testing.T) {
 			assert.False(t, ParseBool(str, false), "Should default to false")
 			assert.True(t, ParseBool(str, true), "Should default to true")
+		})
+	}
+}
+
+func TestIsAWSErrorCodeEqual(t *testing.T) {
+	testcases := []struct {
+		name string
+		err  error
+		res  bool
+	}{
+		{
+			name: "Happy Path",
+			err:  awserr.New(ecs.ErrCodeInvalidParameterException, "errMsg", errors.New("err")),
+			res:  true,
+		},
+		{
+			name: "Wrong Error Code",
+			err:  awserr.New("errCode", "errMsg", errors.New("err")),
+			res:  false,
+		},
+		{
+			name: "Wrong Error Type",
+			err:  errors.New("err"),
+			res:  false,
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.res, IsAWSErrorCodeEqual(tc.err, ecs.ErrCodeInvalidParameterException))
 		})
 	}
 }

@@ -1,4 +1,4 @@
-// +build !windows,!integration
+// +build !windows,unit
 
 // Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
@@ -16,15 +16,13 @@ package engine
 
 import (
 	"context"
-	"errors"
-	"sync"
 	"testing"
 
-	"github.com/aws/amazon-ecs-agent/agent/api"
+	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate/mocks"
-	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
-	"github.com/aws/amazon-ecs-agent/agent/resources/mock_resources"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
+	"github.com/aws/amazon-ecs-agent/agent/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager/mocks"
 	"github.com/golang/mock/gomock"
 
@@ -50,59 +48,19 @@ func TestPullEmptyVolumeImage(t *testing.T) {
 	taskEngine.SetSaver(saver)
 
 	imageName := "image"
-	container := &api.Container{
-		Type:  api.ContainerEmptyHostVolume,
+	container := &apicontainer.Container{
+		Type:  apicontainer.ContainerEmptyHostVolume,
 		Image: imageName,
 	}
-	task := &api.Task{
-		Containers: []*api.Container{container},
+	task := &apitask.Task{
+		Containers: []*apicontainer.Container{container},
 	}
 
 	assert.True(t, emptyvolume.LocalImage, "empty volume image is local")
 	client.EXPECT().ImportLocalEmptyVolumeImage()
 
 	metadata := taskEngine.pullContainer(task, container)
-	assert.Equal(t, DockerContainerMetadata{}, metadata, "expected empty metadata")
-}
-
-func TestDeleteTask(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	task := &api.Task{
-		ENI: &api.ENI{
-			MacAddress: mac,
-		},
-	}
-
-	cfg := &defaultConfig
-	cfg.TaskCPUMemLimit = config.ExplicitlyEnabled
-	mockState := mock_dockerstate.NewMockTaskEngineState(ctrl)
-	mockSaver := mock_statemanager.NewMockStateManager(ctrl)
-	mockResource := mock_resources.NewMockResource(ctrl)
-	taskEngine := &DockerTaskEngine{
-		state:    mockState,
-		saver:    mockSaver,
-		cfg:      &defaultConfig,
-		resource: mockResource,
-	}
-
-	gomock.InOrder(
-		mockResource.EXPECT().Cleanup(task).Return(errors.New("error")),
-		mockState.EXPECT().RemoveTask(task),
-		mockState.EXPECT().RemoveENIAttachment(mac),
-		mockSaver.EXPECT().Save(),
-	)
-
-	var cleanupDone sync.WaitGroup
-	handleCleanupDone := make(chan struct{})
-	cleanupDone.Add(1)
-	go func() {
-		<-handleCleanupDone
-		cleanupDone.Done()
-	}()
-	taskEngine.deleteTask(task, handleCleanupDone)
-	cleanupDone.Wait()
+	assert.Equal(t, dockerapi.DockerContainerMetadata{}, metadata, "expected empty metadata")
 }
 
 func TestEngineDisableConcurrentPull(t *testing.T) {
@@ -112,7 +70,7 @@ func TestEngineDisableConcurrentPull(t *testing.T) {
 	defer ctrl.Finish()
 
 	if dockerVersionCheckDuringInit {
-		client.EXPECT().Version().Return("1.11.0", nil)
+		client.EXPECT().Version(gomock.Any(), gomock.Any()).Return("1.11.0", nil)
 	}
 	client.EXPECT().ContainerEvents(gomock.Any())
 

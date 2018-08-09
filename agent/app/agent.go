@@ -1,4 +1,4 @@
-// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -14,40 +14,41 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
-
-	"context"
 
 	acshandler "github.com/aws/amazon-ecs-agent/agent/acs/handler"
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/api/ecsclient"
+	apierrors "github.com/aws/amazon-ecs-agent/agent/api/errors"
 	"github.com/aws/amazon-ecs-agent/agent/app/factory"
 	"github.com/aws/amazon-ecs-agent/agent/app/oswrapper"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/containermetadata"
 	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/clientfactory"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/ecscni"
 	"github.com/aws/amazon-ecs-agent/agent/engine"
-	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/eni/pause"
 	"github.com/aws/amazon-ecs-agent/agent/eventhandler"
 	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/handlers"
-	"github.com/aws/amazon-ecs-agent/agent/handlers/taskmetadata"
-	"github.com/aws/amazon-ecs-agent/agent/resources"
 	"github.com/aws/amazon-ecs-agent/agent/sighandlers"
 	"github.com/aws/amazon-ecs-agent/agent/sighandlers/exitcodes"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
 	"github.com/aws/amazon-ecs-agent/agent/stats"
+	"github.com/aws/amazon-ecs-agent/agent/taskresource"
 	"github.com/aws/amazon-ecs-agent/agent/tcs/handler"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
+	"github.com/aws/amazon-ecs-agent/agent/utils/mobypkgwrapper"
 	"github.com/aws/amazon-ecs-agent/agent/version"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
 	aws_credentials "github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/cihub/seelog"
@@ -90,7 +91,7 @@ type ecsAgent struct {
 	ctx                   context.Context
 	ec2MetadataClient     ec2.EC2MetadataClient
 	cfg                   *config.Config
-	dockerClient          engine.DockerClient
+	dockerClient          dockerapi.DockerClient
 	containerInstanceARN  string
 	credentialProvider    *aws_credentials.Credentials
 	stateManagerFactory   factory.StateManager
@@ -102,8 +103,9 @@ type ecsAgent struct {
 	subnet                string
 	mac                   string
 	metadataManager       containermetadata.Manager
-	resource              resources.Resource
 	terminationHandler    sighandlers.TerminationHandler
+	mobyPlugins           mobypkgwrapper.Plugins
+	resourceFields        *taskresource.ResourceFields
 }
 
 // newAgent returns a new ecsAgent object, but does not start anything
@@ -132,7 +134,8 @@ func newAgent(
 	seelog.Infof("Amazon ECS agent Version: %s, Commit: %s", version.Version, version.GitShortHash)
 	seelog.Debugf("Loaded config: %s", cfg.String())
 
-	dockerClient, err := engine.NewDockerGoClient(dockerclient.NewFactory(cfg.DockerEndpoint), cfg)
+	dockerClient, err := dockerapi.NewDockerGoClient(
+		clientfactory.NewFactory(ctx, cfg.DockerEndpoint), cfg)
 	if err != nil {
 		// This is also non terminal in the current config
 		seelog.Criticalf("Error creating Docker client: %v", err)
@@ -165,8 +168,8 @@ func newAgent(
 		}),
 		os:                 oswrapper.New(),
 		metadataManager:    metadataManager,
-		resource:           resources.New(),
 		terminationHandler: sighandlers.StartDefaultTerminationHandler,
+		mobyPlugins:        mobypkgwrapper.NewPlugins(),
 	}, nil
 }
 
@@ -198,6 +201,7 @@ func (agent *ecsAgent) start() int {
 	imageManager := engine.NewImageManager(agent.cfg, agent.dockerClient, state)
 	client := ecsclient.NewECSClient(agent.credentialProvider, agent.cfg, agent.ec2MetadataClient)
 
+	agent.initializeResourceFields(credentialsManager)
 	return agent.doStart(containerChangeEventStream, credentialsManager, state, imageManager, client)
 }
 
@@ -209,6 +213,19 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 	state dockerstate.TaskEngineState,
 	imageManager engine.ImageManager,
 	client api.ECSClient) int {
+
+	// check docker version >= 1.9.0, exit agent if older
+	if exitcode, ok := agent.verifyRequiredDockerVersion(); !ok {
+		return exitcode
+	}
+
+	// Conditionally create '/ecs' cgroup root
+	if agent.cfg.TaskCPUMemLimit.Enabled() {
+		if err := agent.cgroupInit(); err != nil {
+			seelog.Criticalf("Unable to initialize cgroup root for ECS: %v", err)
+			return exitcodes.ExitTerminal
+		}
+	}
 
 	// Create the task engine
 	taskEngine, currentEC2InstanceID, err := agent.newTaskEngine(containerChangeEventStream,
@@ -223,22 +240,6 @@ func (agent *ecsAgent) doStart(containerChangeEventStream *eventstream.EventStre
 	if err != nil {
 		seelog.Criticalf("Error creating state manager: %v", err)
 		return exitcodes.ExitTerminal
-	}
-
-	// Conditionally create '/ecs' cgroup root
-	if agent.cfg.TaskCPUMemLimit.Enabled() {
-		agent.resource.ApplyConfigDependencies(agent.cfg)
-		err = agent.resource.Init()
-		// When task CPU and memory limits are enabled, all tasks are placed
-		// under the '/ecs' cgroup root.
-		if err != nil {
-			if agent.cfg.TaskCPUMemLimit == config.ExplicitlyEnabled {
-				seelog.Criticalf("Unable to setup '/ecs' cgroup: %v", err)
-				return exitcodes.ExitTerminal
-			}
-			seelog.Warnf("Disabling TaskCPUMemLimit because agent is unabled to setup '/ecs' cgroup: %v", err)
-			agent.cfg.TaskCPUMemLimit = config.ExplicitlyDisabled
-		}
 	}
 
 	var vpcSubnetAttributes []*ecs.Attribute
@@ -312,13 +313,14 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 		seelog.Info("Checkpointing not enabled; a new container instance will be created each time the agent is run")
 		return engine.NewTaskEngine(agent.cfg, agent.dockerClient, credentialsManager,
 			containerChangeEventStream, imageManager, state,
-			agent.metadataManager, agent.resource), "", nil
+			agent.metadataManager, agent.resourceFields), "", nil
 	}
 
 	// We try to set these values by loading the existing state file first
 	var previousCluster, previousEC2InstanceID, previousContainerInstanceArn string
 	previousTaskEngine := engine.NewTaskEngine(agent.cfg, agent.dockerClient,
-		credentialsManager, containerChangeEventStream, imageManager, state, agent.metadataManager, agent.resource)
+		credentialsManager, containerChangeEventStream, imageManager, state,
+		agent.metadataManager, agent.resourceFields)
 
 	// previousStateManager is used to verify that our current runtime configuration is
 	// compatible with our past configuration as reflected by our state-file
@@ -350,7 +352,8 @@ func (agent *ecsAgent) newTaskEngine(containerChangeEventStream *eventstream.Eve
 		state.Reset()
 		// Reset taskEngine; all the other values are still default
 		return engine.NewTaskEngine(agent.cfg, agent.dockerClient, credentialsManager,
-			containerChangeEventStream, imageManager, state, agent.metadataManager, agent.resource), currentEC2InstanceID, nil
+			containerChangeEventStream, imageManager, state, agent.metadataManager,
+			agent.resourceFields), currentEC2InstanceID, nil
 	}
 
 	if previousCluster != "" {
@@ -464,14 +467,14 @@ func (agent *ecsAgent) registerContainerInstance(
 	containerInstanceArn, err := client.RegisterContainerInstance("", capabilities)
 	if err != nil {
 		seelog.Errorf("Error registering: %v", err)
-		if retriable, ok := err.(utils.Retriable); ok && !retriable.Retry() {
+		if retriable, ok := err.(apierrors.Retriable); ok && !retriable.Retry() {
 			return err
 		}
-		if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == ecs.ErrCodeInvalidParameterException {
+		if utils.IsAWSErrorCodeEqual(err, ecs.ErrCodeInvalidParameterException) {
 			seelog.Critical("Instance registration attempt with an invalid parameter")
 			return err
 		}
-		if _, ok := err.(utils.AttributeError); ok {
+		if _, ok := err.(apierrors.AttributeError); ok {
 			seelog.Critical("Instance registration attempt with an invalid attribute")
 			return err
 		}
@@ -493,11 +496,11 @@ func (agent *ecsAgent) reregisterContainerInstance(client api.ECSClient, capabil
 		return nil
 	}
 	seelog.Errorf("Error re-registering: %v", err)
-	if api.IsInstanceTypeChangedError(err) {
+	if apierrors.IsInstanceTypeChangedError(err) {
 		seelog.Criticalf(instanceTypeMismatchErrorFormat, err)
 		return err
 	}
-	if _, ok := err.(utils.AttributeError); ok {
+	if _, ok := err.(apierrors.AttributeError); ok {
 		seelog.Critical("Instance re-registration attempt with an invalid attribute")
 		return err
 	}
@@ -524,17 +527,18 @@ func (agent *ecsAgent) startAsyncRoutines(
 	go agent.terminationHandler(stateManager, taskEngine)
 
 	// Agent introspection api
-	go handlers.ServeHttp(&agent.containerInstanceARN, taskEngine, agent.cfg)
+	go handlers.V1ServeHTTP(&agent.containerInstanceARN, taskEngine, agent.cfg)
 
 	statsEngine := stats.NewDockerStatsEngine(agent.cfg, agent.dockerClient, containerChangeEventStream)
 
 	// Start serving the endpoint to fetch IAM Role credentials and other task metadata
-	go taskmetadata.ServeHTTP(credentialsManager, state, agent.containerInstanceARN, agent.cfg, statsEngine)
+	go handlers.V2ServeHTTP(credentialsManager, state, agent.containerInstanceARN, agent.cfg, statsEngine)
 
 	// Start sending events to the backend
 	go eventhandler.HandleEngineEvents(taskEngine, client, taskHandler)
 
 	telemetrySessionParams := tcshandler.TelemetrySessionParams{
+		Ctx:                           agent.ctx,
 		CredentialProvider:            agent.credentialProvider,
 		Cfg:                           agent.cfg,
 		ContainerInstanceArn:          agent.containerInstanceARN,
@@ -580,4 +584,27 @@ func (agent *ecsAgent) startACSSession(
 	}
 	seelog.Critical("ACS Session handler should never exit")
 	return exitcodes.ExitError
+}
+
+// validateRequiredVersion validates docker version.
+// Minimum docker version supported is 1.9.0, maps to api version 1.21
+// see https://docs.docker.com/develop/sdk/#api-version-matrix
+func (agent *ecsAgent) verifyRequiredDockerVersion() (int, bool) {
+	supportedVersions := agent.dockerClient.SupportedVersions()
+	if len(supportedVersions) == 0 {
+		seelog.Critical("Could not get supported docker versions.")
+		return exitcodes.ExitError, false
+	}
+
+	// if api version 1.21 is supported, it means docker version is at least 1.9.0
+	for _, version := range supportedVersions {
+		if version == dockerclient.Version_1_21 {
+			return -1, true
+		}
+	}
+
+	// api 1.21 is not supported, docker version is older than 1.9.0
+	seelog.Criticalf("Required minimum docker API verion %s is not supported",
+		dockerclient.Version_1_21)
+	return exitcodes.ExitTerminal, false
 }

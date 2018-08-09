@@ -14,15 +14,16 @@
 package containermetadata
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"time"
 
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ioutilwrapper"
 	"github.com/aws/amazon-ecs-agent/agent/utils/oswrapper"
-	"github.com/aws/amazon-ecs-agent/agent/api"
 
 	docker "github.com/fsouza/go-dockerclient"
 )
@@ -40,8 +41,8 @@ const (
 // operations
 type Manager interface {
 	SetContainerInstanceARN(string)
-	Create(*docker.Config, *docker.HostConfig, *api.Task, string) error
-	Update(string, *api.Task, string) error
+	Create(*docker.Config, *docker.HostConfig, *apitask.Task, string) error
+	Update(context.Context, string, *apitask.Task, string) error
 	Clean(string) error
 }
 
@@ -87,7 +88,7 @@ func (manager *metadataManager) SetContainerInstanceARN(containerInstanceARN str
 // Create creates the metadata file and adds the metadata directory to
 // the container's mounted host volumes
 // Pointer hostConfig is modified directly so there is risk of concurrency errors.
-func (manager *metadataManager) Create(config *docker.Config, hostConfig *docker.HostConfig, task *api.Task, containerName string) error {
+func (manager *metadataManager) Create(config *docker.Config, hostConfig *docker.HostConfig, task *apitask.Task, containerName string) error {
 	// Create task and container directories if they do not yet exist
 	metadataDirectoryPath, err := getMetadataFilePath(task.Arn, containerName, manager.dataDir)
 	// Stop metadata creation if path is malformed for any reason
@@ -116,9 +117,9 @@ func (manager *metadataManager) Create(config *docker.Config, hostConfig *docker
 }
 
 // Update updates the metadata file after container starts and dynamic metadata is available
-func (manager *metadataManager) Update(dockerID string, task *api.Task, containerName string) error {
+func (manager *metadataManager) Update(ctx context.Context, dockerID string, task *apitask.Task, containerName string) error {
 	// Get docker container information through api call
-	dockerContainer, err := manager.client.InspectContainer(dockerID, inspectContainerTimeout)
+	dockerContainer, err := manager.client.InspectContainer(ctx, dockerID, inspectContainerTimeout)
 	if err != nil {
 		return err
 	}

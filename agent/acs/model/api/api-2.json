@@ -104,6 +104,13 @@
     }
   },
   "shapes":{
+    "ASMAuthData":{
+      "type":"structure",
+      "members":{
+        "credentialsParameter":{"shape":"String"},
+        "region":{"shape":"String"}
+      }
+    },
     "AccessDeniedException":{
       "type":"structure",
       "members":{
@@ -137,7 +144,10 @@
     },
     "AuthenticationType":{
       "type":"string",
-      "enum":["ecr"]
+      "enum":[
+        "ecr",
+        "asm"
+      ]
     },
     "BadRequestException":{
       "type":"structure",
@@ -187,6 +197,16 @@
         "hostConfig":{"shape":"String"}
       }
     },
+    "DockerVolumeConfiguration":{
+      "type":"structure",
+      "members":{
+        "scope":{"shape":"Scope"},
+        "autoprovision":{"shape":"Boolean"},
+        "driver":{"shape":"String"},
+        "driverOpts":{"shape":"StringMap"},
+        "labels":{"shape":"StringMap"}
+      }
+    },
     "Double":{"type":"double"},
     "ECRAuthData":{
       "type":"structure",
@@ -207,7 +227,8 @@
         "ipv6Addresses":{"shape":"IPv6AddressList"},
         "domainName":{"shape":"StringList"},
         "domainNameServers":{"shape":"StringList"},
-        "privateDnsName":{"shape":"String"}
+        "privateDnsName":{"shape":"String"},
+        "subnetGatewayIpv4Address":{"shape":"String"}
       }
     },
     "ElasticNetworkInterfaceList":{
@@ -380,7 +401,8 @@
       "type":"structure",
       "members":{
         "type":{"shape":"AuthenticationType"},
-        "ecrAuthData":{"shape":"ECRAuthData"}
+        "ecrAuthData":{"shape":"ECRAuthData"},
+        "asmAuthData":{"shape":"ASMAuthData"}
       }
     },
     "RoleType":{
@@ -388,6 +410,13 @@
       "enum":[
         "TaskApplication",
         "TaskExecution"
+      ]
+    },
+    "Scope":{
+      "type":"string",
+      "enum":[
+        "task",
+        "shared"
       ]
     },
     "SensitiveString":{
@@ -414,6 +443,11 @@
     "StringList":{
       "type":"list",
       "member":{"shape":"String"}
+    },
+    "StringMap":{
+      "type":"map",
+      "key":{"shape":"String"},
+      "value":{"shape":"String"}
     },
     "Task":{
       "type":"structure",
@@ -463,7 +497,9 @@
       "type":"structure",
       "members":{
         "name":{"shape":"String"},
-        "host":{"shape":"HostVolumeProperties"}
+        "type":{"shape":"VolumeType"},
+        "host":{"shape":"HostVolumeProperties"},
+        "dockerVolumeConfiguration":{"shape":"DockerVolumeConfiguration"}
       }
     },
     "VolumeFrom":{
@@ -480,6 +516,13 @@
     "VolumeList":{
       "type":"list",
       "member":{"shape":"Volume"}
+    },
+    "VolumeType":{
+      "type":"string",
+      "enum":[
+        "host",
+        "docker"
+      ]
     }
   }
 }

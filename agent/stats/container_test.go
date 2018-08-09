@@ -1,5 +1,6 @@
-//+build !integration
-// Copyright 2014-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//+build unit
+
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -22,8 +23,10 @@ import (
 	"time"
 
 	"context"
-	"github.com/aws/amazon-ecs-agent/agent/api"
-	ecsengine "github.com/aws/amazon-ecs-agent/agent/engine"
+
+	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi/mocks"
 	mock_resolver "github.com/aws/amazon-ecs-agent/agent/stats/resolver/mock"
 	docker "github.com/fsouza/go-dockerclient"
 	"github.com/golang/mock/gomock"
@@ -49,7 +52,7 @@ var statsData = []*StatTestData{
 func TestContainerStatsCollection(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mockDockerClient := ecsengine.NewMockDockerClient(ctrl)
+	mockDockerClient := mock_dockerapi.NewMockDockerClient(ctrl)
 
 	dockerID := "container1"
 	ctx, cancel := context.WithCancel(context.TODO())
@@ -125,7 +128,7 @@ func TestContainerStatsCollection(t *testing.T) {
 func TestContainerStatsCollectionReconnection(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mockDockerClient := ecsengine.NewMockDockerClient(ctrl)
+	mockDockerClient := mock_dockerapi.NewMockDockerClient(ctrl)
 	resolver := mock_resolver.NewMockContainerMetadataResolver(ctrl)
 
 	dockerID := "container1"
@@ -136,10 +139,10 @@ func TestContainerStatsCollectionReconnection(t *testing.T) {
 	closedChan := make(chan *docker.Stats)
 	close(closedChan)
 
-	mockContainer := &api.DockerContainer{
+	mockContainer := &apicontainer.DockerContainer{
 		DockerID: dockerID,
-		Container: &api.Container{
-			KnownStatusUnsafe: api.ContainerRunning,
+		Container: &apicontainer.Container{
+			KnownStatusUnsafe: apicontainerstatus.ContainerRunning,
 		},
 	}
 	gomock.InOrder(
@@ -167,7 +170,7 @@ func TestContainerStatsCollectionReconnection(t *testing.T) {
 func TestContainerStatsCollectionStopsIfContainerIsTerminal(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	mockDockerClient := ecsengine.NewMockDockerClient(ctrl)
+	mockDockerClient := mock_dockerapi.NewMockDockerClient(ctrl)
 	resolver := mock_resolver.NewMockContainerMetadataResolver(ctrl)
 
 	dockerID := "container1"
@@ -177,10 +180,10 @@ func TestContainerStatsCollectionStopsIfContainerIsTerminal(t *testing.T) {
 	close(closedChan)
 
 	statsErr := fmt.Errorf("test error")
-	mockContainer := &api.DockerContainer{
+	mockContainer := &apicontainer.DockerContainer{
 		DockerID: dockerID,
-		Container: &api.Container{
-			KnownStatusUnsafe: api.ContainerStopped,
+		Container: &apicontainer.Container{
+			KnownStatusUnsafe: apicontainerstatus.ContainerStopped,
 		},
 	}
 	gomock.InOrder(

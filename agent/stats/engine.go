@@ -16,6 +16,7 @@ package stats
 //go:generate go run ../../scripts/generate/mockgen.go github.com/aws/amazon-ecs-agent/agent/stats Engine mock/$GOFILE
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -25,8 +26,12 @@ import (
 	"github.com/pborman/uuid"
 	"github.com/pkg/errors"
 
-	"github.com/aws/amazon-ecs-agent/agent/api"
+	apicontainer "github.com/aws/amazon-ecs-agent/agent/api/container"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
+	apitask "github.com/aws/amazon-ecs-agent/agent/api/task"
 	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient"
+	"github.com/aws/amazon-ecs-agent/agent/dockerclient/dockerapi"
 	ecsengine "github.com/aws/amazon-ecs-agent/agent/engine"
 	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/stats/resolver"
@@ -37,7 +42,7 @@ import (
 const (
 	containerChangeHandler = "DockerStatsEngineDockerEventsHandler"
 	listContainersTimeout  = 10 * time.Minute
-	queueResetThreshold    = 2 * ecsengine.StatsInactivityTimeout
+	queueResetThreshold    = 2 * dockerapi.StatsInactivityTimeout
 )
 
 var (
@@ -66,7 +71,9 @@ type Engine interface {
 // DockerStatsEngine is used to monitor docker container events and to report
 // utlization metrics of the same.
 type DockerStatsEngine struct {
-	client                     ecsengine.DockerClient
+	ctx                        context.Context
+	stopEngine                 context.CancelFunc
+	client                     dockerapi.DockerClient
 	cluster                    string
 	containerInstanceArn       string
 	lock                       sync.RWMutex
@@ -82,7 +89,7 @@ type DockerStatsEngine struct {
 }
 
 // ResolveTask resolves the api task object, given container id.
-func (resolver *DockerContainerMetadataResolver) ResolveTask(dockerID string) (*api.Task, error) {
+func (resolver *DockerContainerMetadataResolver) ResolveTask(dockerID string) (*apitask.Task, error) {
 	if resolver.dockerTaskEngine == nil {
 		return nil, fmt.Errorf("Docker task engine uninitialized")
 	}
@@ -95,7 +102,7 @@ func (resolver *DockerContainerMetadataResolver) ResolveTask(dockerID string) (*
 }
 
 // ResolveContainer resolves the api container object, given container id.
-func (resolver *DockerContainerMetadataResolver) ResolveContainer(dockerID string) (*api.DockerContainer, error) {
+func (resolver *DockerContainerMetadataResolver) ResolveContainer(dockerID string) (*apicontainer.DockerContainer, error) {
 	if resolver.dockerTaskEngine == nil {
 		return nil, fmt.Errorf("Docker task engine uninitialized")
 	}
@@ -109,7 +116,7 @@ func (resolver *DockerContainerMetadataResolver) ResolveContainer(dockerID strin
 
 // NewDockerStatsEngine creates a new instance of the DockerStatsEngine object.
 // MustInit() must be called to initialize the fields of the new event listener.
-func NewDockerStatsEngine(cfg *config.Config, client ecsengine.DockerClient, containerChangeEventStream *eventstream.EventStream) *DockerStatsEngine {
+func NewDockerStatsEngine(cfg *config.Config, client dockerapi.DockerClient, containerChangeEventStream *eventstream.EventStream) *DockerStatsEngine {
 	return &DockerStatsEngine{
 		client:                       client,
 		resolver:                     nil,
@@ -123,7 +130,7 @@ func NewDockerStatsEngine(cfg *config.Config, client ecsengine.DockerClient, con
 
 // synchronizeState goes through all the containers on the instance to synchronize the state on agent start
 func (engine *DockerStatsEngine) synchronizeState() error {
-	listContainersResponse := engine.client.ListContainers(false, ecsengine.ListContainersTimeout)
+	listContainersResponse := engine.client.ListContainers(engine.ctx, false, dockerclient.ListContainersTimeout)
 	if listContainersResponse.Error != nil {
 		return listContainersResponse.Error
 	}
@@ -152,7 +159,11 @@ func (engine *DockerStatsEngine) addAndStartStatsContainer(containerID string) {
 }
 
 // MustInit initializes fields of the DockerStatsEngine object.
-func (engine *DockerStatsEngine) MustInit(taskEngine ecsengine.TaskEngine, cluster string, containerInstanceArn string) error {
+func (engine *DockerStatsEngine) MustInit(ctx context.Context, taskEngine ecsengine.TaskEngine, cluster string, containerInstanceArn string) error {
+	derivedCtx, cancel := context.WithCancel(ctx)
+	engine.stopEngine = cancel
+
+	engine.ctx = derivedCtx
 	// TODO ensure that this is done only once per engine object
 	seelog.Info("Initializing stats engine")
 	engine.cluster = cluster
@@ -177,6 +188,17 @@ func (engine *DockerStatsEngine) MustInit(taskEngine ecsengine.TaskEngine, clust
 
 	go engine.waitToStop()
 	return nil
+}
+
+// Shutdown cleans up the resources after the statas engine.
+func (engine *DockerStatsEngine) Shutdown() {
+	engine.stopEngine()
+	engine.Disable()
+}
+
+// Disable prevents this engine from managing any additional tasks.
+func (engine *DockerStatsEngine) Disable() {
+	engine.lock.Lock()
 }
 
 // waitToStop waits for the container change event stream close ans stop collection metrics
@@ -479,15 +501,15 @@ func (engine *DockerStatsEngine) getTaskHealthUnsafe(taskARN string) *ecstcs.Tas
 // event that it reads from the docker event stream.
 func (engine *DockerStatsEngine) handleDockerEvents(events ...interface{}) error {
 	for _, event := range events {
-		dockerContainerChangeEvent, ok := event.(ecsengine.DockerContainerChangeEvent)
+		dockerContainerChangeEvent, ok := event.(dockerapi.DockerContainerChangeEvent)
 		if !ok {
 			return fmt.Errorf("Unexpected event received, expected docker container change event")
 		}
 
 		switch dockerContainerChangeEvent.Status {
-		case api.ContainerRunning:
+		case apicontainerstatus.ContainerRunning:
 			engine.addAndStartStatsContainer(dockerContainerChangeEvent.DockerID)
-		case api.ContainerStopped:
+		case apicontainerstatus.ContainerStopped:
 			engine.removeContainer(dockerContainerChangeEvent.DockerID)
 		default:
 			seelog.Debugf("Ignoring event for container, id: %s, status: %d", dockerContainerChangeEvent.DockerID, dockerContainerChangeEvent.Status)

@@ -1,4 +1,4 @@
-// Copyright 2014-2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
+	apicontainerstatus "github.com/aws/amazon-ecs-agent/agent/api/container/status"
+	apierrors "github.com/aws/amazon-ecs-agent/agent/api/errors"
 	"github.com/aws/amazon-ecs-agent/agent/async"
 	"github.com/aws/amazon-ecs-agent/agent/config"
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
@@ -237,7 +239,7 @@ func findMissingAttributes(expectedAttributes, actualAttributes map[string]strin
 		}
 	}
 	if len(missingAttributes) > 0 {
-		err = utils.NewAttributeError("Attribute validation failed")
+		err = apierrors.NewAttributeError("Attribute validation failed")
 	}
 	return missingAttributes, err
 }
@@ -271,7 +273,7 @@ func getCpuAndMemory() (int64, int64) {
 func (client *APIECSClient) getAdditionalAttributes() []*ecs.Attribute {
 	return []*ecs.Attribute{&ecs.Attribute{
 		Name:  aws.String("ecs.os-type"),
-		Value: aws.String(api.OSType),
+		Value: aws.String(config.OSType),
 	}}
 }
 
@@ -355,7 +357,7 @@ func (client *APIECSClient) buildContainerStateChangePayload(change api.Containe
 	}
 	status := change.Status
 
-	if status != api.ContainerStopped && status != api.ContainerRunning {
+	if status != apicontainerstatus.ContainerStopped && status != apicontainerstatus.ContainerRunning {
 		seelog.Warnf("Not submitting unsupported upstream container state %s for container %s in task %s",
 			status.String(), change.ContainerName, change.TaskArn)
 		return nil

@@ -26,7 +26,7 @@
 
 [[constraint]]
   name = "github.com/aws/aws-sdk-go"
-  version = "1.10.30"
+  version = "1.13.42"
 
 [[constraint]]
   name = "github.com/cihub/seelog"
@@ -50,7 +50,7 @@
 
 [[constraint]]
   name = "github.com/fsouza/go-dockerclient"
-  revision ="d25e8d2941bd448756b336a2ec3abf79802d6ddf"
+  revision ="be08a2e7eafecb4d8c6bc61be94233a06904a121"
 
 [[constraint]]
   name = "github.com/golang/mock"
@@ -81,14 +81,9 @@
   revision ="fe3b5664d23a11b52ba59bece4ff29c52772a56b"
 
 [[constraint]]
-  name = "golang.org/x/net"
-
-[[constraint]]
-  name = "golang.org/x/sys"
-
-[[constraint]]
-  name = "golang.org/x/tools"
-
-[[constraint]]
   name = "github.com/didip/tollbooth"
   version = "3.0.2"
+
+[[constraint]]
+  name = "github.com/gorilla/mux"
+  version = "1.6.2"
