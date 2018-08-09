@@ -447,7 +447,7 @@ func (task *Task) initializeCredentialsEndpoint(credentialsManager credentials.M
 				seelog.Error(err)
 				_, skip_error := container.Environment["vault_skip_error"]
                                 if(!skip_error) {
-	                                task.SetDesiredStatus(TaskStopped)
+	                                task.SetDesiredStatus(apitaskstatus.TaskStopped)
 				}
 			}
 			container.Environment = envvars
